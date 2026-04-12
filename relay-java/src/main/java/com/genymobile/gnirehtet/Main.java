@@ -33,6 +33,8 @@ public final class Main {
     private static final String TAG = "Gnirehtet";
     private static final String NL = System.lineSeparator();
     private static final String REQUIRED_APK_VERSION_CODE = "9";
+    private static final int START_RETRY_ATTEMPTS = 5;
+    private static final long START_RETRY_DELAY_STEP_MS = 1000;
 
     private Main() {
         // not instantiable
@@ -135,7 +137,7 @@ public final class Main {
 
             @Override
             void execute(CommandLineArguments args) throws Exception {
-                cmdStart(args.getSerial(), args.getDnsServers(), args.getRoutes(), args.getPort());
+                cmdStartWithRetries(args.getSerial(), args.getDnsServers(), args.getRoutes(), args.getPort());
             }
         },
         AUTOSTART("autostart", CommandLineArguments.PARAM_DNS_SERVER | CommandLineArguments.PARAM_ROUTES | CommandLineArguments.PARAM_PORT) {
@@ -289,6 +291,36 @@ public final class Main {
         execAdb(serial, cmd);
     }
 
+    private static void cmdStartWithRetries(String serial, String dnsServers, String routes, int port) throws InterruptedException, IOException,
+            CommandExecutionException {
+        Exception lastException = null;
+        for (int attempt = 1; attempt <= START_RETRY_ATTEMPTS; ++attempt) {
+            try {
+                cmdStart(serial, dnsServers, routes, port);
+                return;
+            } catch (InterruptedException e) {
+                Thread.currentThread().interrupt();
+                throw e;
+            } catch (IOException | CommandExecutionException e) {
+                lastException = e;
+                if (attempt == START_RETRY_ATTEMPTS) {
+                    break;
+                }
+                long retryDelayMs = attempt * START_RETRY_DELAY_STEP_MS;
+                Log.w(TAG, "Cannot start client, retrying in " + retryDelayMs + "ms (attempt " + attempt + "/" + START_RETRY_ATTEMPTS + ")", e);
+                Thread.sleep(retryDelayMs);
+            }
+        }
+
+        if (lastException instanceof IOException) {
+            throw (IOException) lastException;
+        }
+        if (lastException instanceof CommandExecutionException) {
+            throw (CommandExecutionException) lastException;
+        }
+        throw new AssertionError("Client start failed without an exception");
+    }
+
     private static void cmdAutostart(final String dnsServers, final String routes, int port) {
         AdbMonitor adbMonitor = new AdbMonitor((serial) -> {
             asyncStart(serial, dnsServers, routes, port);
@@ -357,7 +389,7 @@ public final class Main {
     private static void cmdRestart(String serial, String dnsServers, String routes, int port) throws InterruptedException, IOException,
             CommandExecutionException {
         cmdStop(serial);
-        cmdStart(serial, dnsServers, routes, port);
+        cmdStartWithRetries(serial, dnsServers, routes, port);
     }
 
     private static void cmdTunnel(String serial, int port) throws InterruptedException, IOException, CommandExecutionException {
@@ -372,7 +404,7 @@ public final class Main {
     private static void asyncStart(String serial, String dnsServers, String routes, int port) {
         new Thread(() -> {
             try {
-                cmdStart(serial, dnsServers, routes, port);
+                cmdStartWithRetries(serial, dnsServers, routes, port);
             } catch (Exception e) {
                 Log.e(TAG, "Cannot start client", e);
             }
