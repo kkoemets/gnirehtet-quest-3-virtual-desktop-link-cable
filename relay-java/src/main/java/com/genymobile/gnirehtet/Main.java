@@ -232,13 +232,19 @@ public final class Main {
     }
 
     private static void cmdRun(String serial, String dnsServers, String routes, int port) throws IOException {
-        // start in parallel so that the relay server is ready when the client connects
-        asyncStart(serial, dnsServers, routes, port);
+        String runSerial = resolveRunSerial(serial);
+        if (runSerial != null) {
+            // start in parallel so that the relay server is ready when the client connects
+            asyncMonitorStart(runSerial, dnsServers, routes, port);
+        } else {
+            // fall back to the historical one-shot behavior if no single device can be identified
+            asyncStart(serial, dnsServers, routes, port);
+        }
 
         Runtime.getRuntime().addShutdownHook(new Thread(() -> {
             // executed on Ctrl+C
             try {
-                cmdStop(serial);
+                cmdStop(runSerial != null ? runSerial : serial);
             } catch (Exception e) {
                 Log.e(TAG, "Cannot stop client", e);
             }
@@ -288,6 +294,58 @@ public final class Main {
             asyncStart(serial, dnsServers, routes, port);
         });
         adbMonitor.monitor();
+    }
+
+    private static String resolveRunSerial(String serial) {
+        if (serial != null) {
+            return serial;
+        }
+
+        try {
+            String currentDeviceSerial = getCurrentDeviceSerial();
+            if (currentDeviceSerial != null && !currentDeviceSerial.isEmpty() && !"unknown".equals(currentDeviceSerial)) {
+                return currentDeviceSerial;
+            }
+            Log.w(TAG, "Cannot determine a device serial for automatic reconnects, keeping the previous one-shot behavior");
+        } catch (InterruptedException | IOException | CommandExecutionException e) {
+            Log.w(TAG, "Cannot determine a device serial for automatic reconnects, keeping the previous one-shot behavior", e);
+        }
+        return null;
+    }
+
+    private static String getCurrentDeviceSerial() throws InterruptedException, IOException, CommandExecutionException {
+        List<String> command = createAdbCommand(null, "get-serialno");
+        Log.d(TAG, "Execute: " + command);
+        ProcessBuilder processBuilder = new ProcessBuilder(command);
+        processBuilder.redirectErrorStream(true);
+        Process process = processBuilder.start();
+        try {
+            Scanner scanner = new Scanner(process.getInputStream());
+            try {
+                if (scanner.hasNextLine()) {
+                    return scanner.nextLine().trim();
+                }
+                return null;
+            } finally {
+                scanner.close();
+            }
+        } finally {
+            int exitCode = process.waitFor();
+            if (exitCode != 0) {
+                throw new CommandExecutionException(command, exitCode);
+            }
+        }
+    }
+
+    private static void asyncMonitorStart(String serial, String dnsServers, String routes, int port) {
+        new Thread(() -> {
+            AdbMonitor adbMonitor = new AdbMonitor((connectedSerial) -> {
+                if (serial.equals(connectedSerial)) {
+                    asyncStart(serial, dnsServers, routes, port);
+                }
+            });
+            adbMonitor.monitor();
+        }).start();
     }
 
     private static void cmdStop(String serial) throws InterruptedException, IOException, CommandExecutionException {
