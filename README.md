@@ -17,22 +17,10 @@ _**This project is not actively maintained anymore, only major blockers (like
 build issues) are fixed. It should still work, though.**_
 
 
-## Flavors
+## Relay Server
 
-Two implementations of _Gnirehtet_ are available:
- - one in **Java**;
- - one in **Rust**.
-
-
-### Which one to choose?
-
-Use the **Rust** implementation. The native binary consumes less CPU and memory,
-and does not require a _Java_ runtime environment.
-
-The relay server of _Gnirehtet_ was initially only implemented in Java. As a
-benefit, the same "binary" runs on every platform having _Java 8_ runtime
-installed. It is still maintained to provide a working alternative in case of
-problems with the Rust version.
+This repository ships the **Java** relay server. It runs on every platform
+having a _Java 8_ runtime installed.
 
 
 ## Requirements
@@ -69,49 +57,11 @@ Make sure you [enabled adb debugging][enable-adb] on your device(s).
 
 ## Get the app
 
-### Homebrew
-
-If you use [Homebrew](https://brew.sh/), getting up and running is very quick.
-To install the Rust version:
-
-```
-brew install gnirehtet
-```
-
 ### Download
 
-Download the [latest release][latest] in the flavor you want.
+Download the [latest release][latest].
 
 [latest]: https://github.com/Genymobile/gnirehtet/releases/latest
-
-
-#### Rust
-
- - **Linux:** [`gnirehtet-rust-linux64-v2.5.1.zip`][direct-rust-linux64]  
-   (SHA-256: _dee55499ca4fef00ce2559c767d2d8130163736d43fdbce753e923e75309c275_)
- - **Windows:** [`gnirehtet-rust-win64-v2.5.1.zip`][direct-rust-win64]  
-   (SHA-256: _7f5b1063e7895182aa60def1437e50363c3758144088dcd079037bb7c3c46a1c_)
- - **MacOS:** [`gnirehtet-rust-macos64-v2.2.1.zip`][direct-rust-macos64]
-   _(old release)_  
-   (SHA-256: _902103e6497f995e1e9b92421be212559950cca4a8b557e1f0403769aee06fc8_)
-
-[direct-rust-linux64]: https://github.com/Genymobile/gnirehtet/releases/download/v2.5.1/gnirehtet-rust-linux64-v2.5.1.zip
-[direct-rust-win64]: https://github.com/Genymobile/gnirehtet/releases/download/v2.5.1/gnirehtet-rust-win64-v2.5.1.zip
-[direct-rust-macos64]: https://github.com/Genymobile/gnirehtet/releases/download/v2.2.1/gnirehtet-rust-macos64-v2.2.1.zip
-
-Then extract it.
-
-The Linux and MacOS archives contain:
- - `gnirehtet.apk`
- - `gnirehtet`
-
-The Windows archive contains:
- - `gnirehtet.apk`
- - `gnirehtet.exe`
- - `gnirehtet-run.cmd`
-
-
-#### Java
 
  - **All platforms:** [`gnirehtet-java-v2.5.1.zip`][direct-java]  
    (SHA-256: _816748078fa6a304600a294a13338a06ac778bcc0e57b62d88328c7968ad2d3a_)
@@ -264,11 +214,6 @@ Read the [developers page].
 ## Articles
 
 - [Introducing “gnirehtet”, a reverse tethering tool for Android][medium-1] ([French version][blog-1])
-- [Gnirehtet 2: our reverse tethering tool for Android now available in Rust][medium-2]
-- [Gnirehtet rewritten in Rust][blog-2-en] ([French version][blog-2-fr])
 
 [medium-1]: https://medium.com/@rom1v/gnirehtet-reverse-tethering-android-2afacdbdaec7
 [blog-1]: https://blog.rom1v.com/2017/03/gnirehtet/
-[medium-2]: https://medium.com/genymobile/gnirehtet-2-our-reverse-tethering-tool-for-android-now-available-in-rust-999960483d5a
-[blog-2-en]: https://blog.rom1v.com/2017/09/gnirehtet-rewritten-in-rust/
-[blog-2-fr]: https://blog.rom1v.com/2017/09/gnirehtet-reecrit-en-rust/
