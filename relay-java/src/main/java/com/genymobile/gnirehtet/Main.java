@@ -24,8 +24,10 @@ import java.io.IOException;
 import java.util.ArrayList;
 import java.util.Arrays;
 import java.util.Collections;
+import java.util.HashSet;
 import java.util.List;
 import java.util.Scanner;
+import java.util.Set;
 import java.util.regex.Matcher;
 import java.util.regex.Pattern;
 
@@ -35,6 +37,8 @@ public final class Main {
     private static final String REQUIRED_APK_VERSION_CODE = "9";
     private static final int START_RETRY_ATTEMPTS = 5;
     private static final long START_RETRY_DELAY_STEP_MS = 1000;
+    private static final String DEFAULT_START_KEY = "<default>";
+    private static final Set<String> STARTING_SERIALS = Collections.synchronizedSet(new HashSet<>());
 
     private Main() {
         // not instantiable
@@ -402,13 +406,35 @@ public final class Main {
     }
 
     private static void asyncStart(String serial, String dnsServers, String routes, int port) {
+        if (!markStartPending(serial)) {
+            Log.i(TAG, "Start already in progress for " + getStartTarget(serial) + ", skipping duplicate request");
+            return;
+        }
         new Thread(() -> {
             try {
                 cmdStartWithRetries(serial, dnsServers, routes, port);
             } catch (Exception e) {
                 Log.e(TAG, "Cannot start client", e);
+            } finally {
+                clearStartPending(serial);
             }
         }).start();
+    }
+
+    private static boolean markStartPending(String serial) {
+        return STARTING_SERIALS.add(getStartKey(serial));
+    }
+
+    private static void clearStartPending(String serial) {
+        STARTING_SERIALS.remove(getStartKey(serial));
+    }
+
+    private static String getStartKey(String serial) {
+        return serial != null ? serial : DEFAULT_START_KEY;
+    }
+
+    private static String getStartTarget(String serial) {
+        return serial != null ? serial : "the default adb device";
     }
 
     private static void execAdb(String serial, String... adbArgs) throws InterruptedException, IOException, CommandExecutionException {
