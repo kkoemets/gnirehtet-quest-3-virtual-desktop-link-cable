@@ -103,7 +103,7 @@ public class TCPConnection extends AbstractConnection implements PacketSource {
 
     @Override
     public void disconnect() {
-        logi(TAG, "Close");
+        logd(TAG, "Close");
         selectionKey.cancel();
         try {
             channel.close();
@@ -192,8 +192,9 @@ public class TCPConnection extends AbstractConnection implements PacketSource {
     }
 
     private SocketChannel createChannel() throws IOException {
-        logi(TAG, "Open");
+        logd(TAG, "Open");
         SocketChannel socketChannel = SocketChannel.open();
+        socketChannel.socket().setTcpNoDelay(true);
         socketChannel.configureBlocking(false);
         socketChannel.connect(getRewrittenDestination());
         return socketChannel;
