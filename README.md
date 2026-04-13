@@ -1,9 +1,9 @@
-# Gnirehtet Quest 3 Fork (v3.0.0)
+# Gnirehtet For Quest 3 (v3.0.0)
 
-This fork packages **gnirehtet** as a practical reverse-tethering tool for
+This project packages **gnirehtet** as a practical reverse-tethering tool for
 **Meta Quest 3 over Link cable / USB**. The goal is simple: let the headset use
 the host computer's internet connection through `adb`, with Quest 3-focused
-reconnect and startup fixes on top of the original project.
+reconnect and startup fixes.
 
 This is still the same core model:
 
@@ -13,105 +13,79 @@ This is still the same core model:
 
 It does **not** require root on the headset or on the computer.
 
-## Scope
+## Quest 3 Start Here
 
-This repository is now maintained as a **Quest 3 link-cable reverse tethering
-fork**. It is intentionally focused on:
+If you only want the simple Quest 3 setup, read this section and ignore the
+advanced reference lower down.
 
-- Quest 3 setup over USB / Link cable
-- the Android app in [`app/`](app/)
-- the Java relay in [`relay-java/`](relay-java/)
-- release packaging that ships the APK, the relay jar, and the launcher scripts
-
-It no longer ships the Rust relay.
-
-## What This Is Not
-
-This project is useful for getting Quest 3 online over cable, but it is still
-not a true Ethernet bridge or same-LAN replacement.
-
-- It tunnels IPv4 traffic, not IPv6.
-- It uses Android `VpnService`, so some apps that expect real local network
-  behavior may still behave differently from Wi-Fi.
-- If the cable or `adb` connection drops, live TCP sessions are reset and must
-  reconnect. The fork improves recovery, but it does not preserve in-flight
-  sessions.
-
-## Requirements
+### What you need
 
 - Meta Quest 3 with Developer Mode enabled
 - USB debugging enabled on the headset
 - a working USB / Link cable connection to the host computer
 - recent [Android platform-tools / `adb`][platform-tools]
-- Java on the host for running `gnirehtet.jar`
+- Java on the host for running Gnirehtet
 
-The Android application still targets API 21+.
+`adb` is mandatory for this project. Gnirehtet uses it to talk to the Quest,
+install the APK, create the `adb reverse` tunnel, start the client, stop the
+client, and recover after reconnects. Without platform-tools / `adb`, Gnirehtet
+cannot work.
+
+If `java -version` works on your computer, that is enough for the release
+bundle.
+
+The first connection requires approving the USB debugging fingerprint prompt in
+the headset.
+
+### What you do not need
+
+- SideQuest for the normal setup path
+- a manual APK install on a fresh install
+
+SideQuest is not required because it is only another way to sideload APKs over
+`adb`. Gnirehtet already uses `adb` directly, and `gnirehtet run` installs the
+app automatically when needed and then starts it for you.
 
 On Windows, if you only need `adb` for this project, download the
-[platform-tools archive][platform-tools-windows] and place these files next to
-the release bundle:
+[platform-tools archive][platform-tools-windows] and either keep `adb` in your
+PATH or place these files next to Gnirehtet:
 
 - `adb.exe`
 - `AdbWinApi.dll`
 - `AdbWinUsbApi.dll`
 
-The first connection requires approving the USB debugging fingerprint prompt in
-the headset.
+### Fast setup
 
-[platform-tools]: https://developer.android.com/studio/releases/platform-tools
-[platform-tools-windows]: https://dl.google.com/android/repository/platform-tools-latest-windows.zip
-
-## Releases
-
-Download releases from this fork's releases page:
-
-- [Latest release](https://github.com/kkoemets/gnirehtet/releases/latest)
-
-The release archive keeps the same simple layout:
-
-- `gnirehtet.apk`
-- `gnirehtet.jar`
-- `gnirehtet`
-- `gnirehtet.cmd`
-- `gnirehtet-run.cmd`
-
-For this fork, the intended public release line starts at `v3.0.0`.
-
-Important upgrade note:
-
-- this fork is signed with a different key than the original upstream project
-- if you already installed the old upstream APK, uninstall it once before
-  installing this fork's APK, otherwise `adb install -r gnirehtet.apk` will
-  fail with an update-signature mismatch
-
-## Quick Start For Quest 3
+1. Download the [latest release](https://github.com/kkoemets/gnirehtet/releases/latest) and extract it.
+2. Connect the Quest 3 by cable.
+3. Put on the headset and accept the USB debugging prompt.
+4. Start Gnirehtet.
 
 On macOS and Linux:
 
-If you are replacing the old upstream APK, run this once first:
-
 ```bash
-adb uninstall com.genymobile.gnirehtet
-```
-
-```bash
-adb install -r gnirehtet.apk
 ./gnirehtet run
 ```
 
 On Windows:
 
-1. If the old upstream APK is already installed, run `adb uninstall com.genymobile.gnirehtet` once.
-2. Install `gnirehtet.apk` with `adb install -r gnirehtet.apk`.
-3. Double-click `gnirehtet-run.cmd`, or run `gnirehtet run` in a terminal.
+- double-click `gnirehtet-run.cmd`
+- or run `gnirehtet run` in a terminal
 
-What to expect:
+On a fresh install, `run` installs the app automatically if it is missing. If
+you already had another Gnirehtet build installed on the headset and the first
+run fails to install, remove the old app once:
+
+```bash
+adb uninstall com.genymobile.gnirehtet
+```
+
+### What success looks like
 
 - the first launch asks the headset to allow the VPN connection
-- a key icon appears while gnirehtet is active
-- `run` keeps the relay open in the current terminal
-- if the headset disconnects and reconnects, this fork attempts to restore the
-  client automatically when `adb` comes back
+- a key icon appears while Gnirehtet is active
+- `run` keeps the relay open in the current terminal or command window
+- with Quest Wi-Fi turned off, the headset still has internet access
 
 The original permission UI still looks like this:
 
@@ -121,7 +95,41 @@ When active, Android shows the VPN key icon:
 
 ![key](assets/key.png)
 
-## Commands
+### Virtual Desktop order
+
+1. Start Virtual Desktop Streamer on the PC first.
+2. Start Gnirehtet and approve the Quest prompts.
+3. Turn off Quest Wi-Fi if you want the cable-only path.
+4. Open Virtual Desktop on the headset.
+
+Community reports show that Virtual Desktop's network wording can be confusing
+on this setup. The more reliable signals are the Gnirehtet VPN prompt, the key
+icon, and the fact that the headset still has internet access with Wi-Fi
+disabled.
+
+### Common problems
+
+- The download looks incomplete: download the latest release again from GitHub.
+- The window only shows `Starting relay server...`: `adb` often does not yet
+  see an authorized Quest. Run `adb devices`, put on the headset, accept the
+  USB debugging prompt, then try again.
+- `adb devices` shows more than one device: pass the serial explicitly, for
+  example `./gnirehtet run 1WMHH...`.
+- The first install fails with a signature mismatch: uninstall any older
+  Gnirehtet app from the headset once, then retry.
+- The cable was unplugged and plugged back in: Gnirehtet attempts to recover
+  when `adb` comes back, but live TCP sessions are reset. If the headset asks
+  again for USB debugging authorization, approve it before expecting recovery.
+- Virtual Desktop cannot see the PC at all: confirm that Virtual Desktop
+  Streamer is already running on the PC before you launch Virtual Desktop on
+  the headset.
+
+Most Quest 3 users can stop reading here.
+
+<details>
+<summary>Advanced CLI reference</summary>
+
+### Commands
 
 The high-level entry point is still the `gnirehtet` CLI. On Windows, replace
 `./gnirehtet` with `gnirehtet`.
@@ -170,7 +178,7 @@ Monitor future device connections and auto-start them:
 
 If `adb devices` lists more than one device, pass the serial explicitly.
 
-## Manual Commands
+### Manual commands
 
 If you prefer to drive the lower-level pieces yourself:
 
@@ -182,13 +190,13 @@ Start the relay:
 
 Install the APK:
 
-If you are replacing the old upstream APK, uninstall it once first:
+If you need to remove an older Gnirehtet app first:
 
 ```bash
 adb uninstall com.genymobile.gnirehtet
 ```
 
-Then install the fork release:
+Then install the app:
 
 ```bash
 adb install -r gnirehtet.apk
@@ -209,16 +217,7 @@ adb shell am start -a com.genymobile.gnirehtet.STOP \
     -n com.genymobile.gnirehtet/.GnirehtetActivity
 ```
 
-## Quest 3 Notes
-
-- This fork improves reconnect behavior for `run`, but a reconnect still
-  rebuilds the tunnel instead of resuming existing flows.
-- If the headset asks again for USB debugging authorization after reconnect,
-  approve it before expecting the tunnel to recover.
-- Some apps may still be sensitive to discovery or same-LAN assumptions because
-  this is a VPN-over-ADB path, not a native Ethernet device.
-
-## Environment Variables
+### Environment variables
 
 Use a custom `adb` binary:
 
@@ -232,25 +231,40 @@ Use a custom APK path:
 GNIREHTET_APK=/path/to/gnirehtet.apk ./gnirehtet run
 ```
 
-## Developers
+</details>
+
+<details>
+<summary>Project scope and limits</summary>
+
+### What this is not
+
+This project is useful for getting Quest 3 online over cable, but it is still
+not a true Ethernet bridge or same-LAN replacement.
+
+- It tunnels IPv4 traffic, not IPv6.
+- It uses Android `VpnService`, so some apps that expect real local network
+  behavior may still behave differently from Wi-Fi.
+- If the cable or `adb` connection drops, live TCP sessions are reset and must
+  reconnect. The reconnect path does not preserve in-flight sessions.
+
+### Quest 3 notes
+
+- `run` is intended to recover better after reconnects, but a reconnect still
+  rebuilds the tunnel instead of resuming existing flows.
+- If the headset asks again for USB debugging authorization after reconnect,
+  approve it before expecting the tunnel to recover.
+- Some apps may still be sensitive to discovery or same-LAN assumptions because
+  this is a VPN-over-ADB path, not a native Ethernet device.
+
+### Developers
 
 See [DEVELOP.md](DEVELOP.md) for build, release, and architecture details for
-this fork.
+this project.
 
-## Upstream
+</details>
 
-This fork is based on the original Genymobile project and keeps the same
-package name and core architecture. The fork exists because the original
-project is effectively dormant while Quest 3 users still need a working wired
-reverse-tethering path.
-
-Original project articles:
-
-- [Introducing “gnirehtet”, a reverse tethering tool for Android][medium-1]
-- [French version][blog-1]
-
-[medium-1]: https://medium.com/@rom1v/gnirehtet-reverse-tethering-android-2afacdbdaec7
-[blog-1]: https://blog.rom1v.com/2017/03/gnirehtet/
+[platform-tools]: https://developer.android.com/studio/releases/platform-tools
+[platform-tools-windows]: https://dl.google.com/android/repository/platform-tools-latest-windows.zip
 
 ## License
 
