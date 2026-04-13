@@ -34,7 +34,7 @@ import java.util.regex.Pattern;
 public final class Main {
     private static final String TAG = "Gnirehtet";
     private static final String NL = System.lineSeparator();
-    private static final String REQUIRED_APK_VERSION_CODE = "9";
+    private static final String REQUIRED_APK_VERSION_CODE = "10";
     private static final int START_RETRY_ATTEMPTS = 5;
     private static final long START_RETRY_DELAY_STEP_MS = 1000;
     private static final String DEFAULT_START_KEY = "<default>";
