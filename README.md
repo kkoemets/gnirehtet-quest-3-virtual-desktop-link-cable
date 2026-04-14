@@ -56,6 +56,12 @@ PATH or place these files next to Gnirehtet:
 - `AdbWinApi.dll`
 - `AdbWinUsbApi.dll`
 
+The release bundle also includes `gnirehtet-get-adb.cmd`, which downloads
+Google's official Windows platform-tools into the same folder for you.
+
+It also includes a small `README.txt` in the zip for the basic Quest 3 setup
+flow.
+
 ### Fast setup
 
 1. Download the [latest release](https://github.com/kkoemets/gnirehtet/releases/latest) and extract it.
@@ -71,6 +77,8 @@ On macOS and Linux:
 
 On Windows:
 
+- if `adb` is not already in your PATH and not already next to Gnirehtet,
+  double-click `gnirehtet-get-adb.cmd` once
 - double-click `gnirehtet-run.cmd`
 - or run `gnirehtet run` in a terminal
 
@@ -115,6 +123,8 @@ disabled.
 - The window only shows `Starting relay server...`: `adb` often does not yet
   see an authorized Quest. Run `adb devices`, put on the headset, accept the
   USB debugging prompt, then try again.
+- Windows says `adb` is not found: run `gnirehtet-get-adb.cmd` from the release
+  folder, then retry `gnirehtet-run.cmd`.
 - `adb devices` shows more than one device: pass the serial explicitly, for
   example `./gnirehtet run 1WMHH...`.
 - The first install fails with a signature mismatch: uninstall any older
