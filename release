@@ -21,8 +21,10 @@ mkdir -p "$DIST/$TARGET_DIR_JAVA"
 cp app/build/outputs/apk/release/gnirehtet-release.apk "$DIST/$TARGET_DIR_JAVA"/gnirehtet.apk
 
 cp relay-java/build/libs/gnirehtet.jar \
+   relay-java/scripts/README.txt \
    relay-java/scripts/gnirehtet \
    relay-java/scripts/gnirehtet.cmd \
+   relay-java/scripts/gnirehtet-get-adb.cmd \
    relay-java/scripts/gnirehtet-run.cmd \
    "$DIST/$TARGET_DIR_JAVA"/
 

@@ -64,8 +64,10 @@ The release bundle is still built around the same files:
 
 - `gnirehtet.apk`
 - `gnirehtet.jar`
+- `README.txt`
 - `gnirehtet`
 - `gnirehtet.cmd`
+- `gnirehtet-get-adb.cmd`
 - `gnirehtet-run.cmd`
 
 The packaging script is [`release`](release). It expects:
