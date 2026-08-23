@@ -1552,6 +1552,7 @@ enum TrayCoordinatorRequest {
     Wake {
         report_stop_error: bool,
     },
+    HostResume,
     Diagnose,
     Exit,
     External {
@@ -1566,6 +1567,7 @@ type TrayCoordinatorFuture<'a, T> =
 
 #[cfg(any(target_os = "windows", test))]
 trait TrayCoordinatorBackend: Send + Sync + 'static {
+    fn host_resume(&self) -> TrayCoordinatorFuture<'_, Result<()>>;
     fn diagnose(&self) -> TrayCoordinatorFuture<'_, Result<()>>;
     fn execute_external(&self, command: Command) -> TrayCoordinatorFuture<'_, Result<String>>;
     fn reconcile(&self) -> TrayCoordinatorFuture<'_, Result<bool>>;
@@ -1583,6 +1585,39 @@ struct WindowsTrayBackend {
 
 #[cfg(target_os = "windows")]
 impl TrayCoordinatorBackend for WindowsTrayBackend {
+    fn host_resume(&self) -> TrayCoordinatorFuture<'_, Result<()>> {
+        Box::pin(async move {
+            if !tray_desired_on()
+                || !read_daemon_pid(&self.context.paths.daemon_pid).is_some_and(process_is_running)
+            {
+                return Ok(());
+            }
+            let mut last_error = None;
+            for attempt in 0..3 {
+                match admin_command(&self.context.paths, "host_resume", Duration::from_secs(4))
+                    .await
+                {
+                    Ok(response) if response.ok => return Ok(()),
+                    Ok(response) => {
+                        last_error = Some(
+                            response
+                                .error
+                                .unwrap_or_else(|| "runtime rejected host resume recovery".into()),
+                        );
+                    }
+                    Err(error) => last_error = Some(error.to_string()),
+                }
+                if attempt < 2 {
+                    tokio::time::sleep(Duration::from_millis(500)).await;
+                }
+            }
+            bail!(
+                "runtime did not accept host resume recovery: {}",
+                last_error.unwrap_or_else(|| "unknown error".into())
+            )
+        })
+    }
+
     fn diagnose(&self) -> TrayCoordinatorFuture<'_, Result<()>> {
         Box::pin(async move {
             self.context
@@ -1774,6 +1809,13 @@ impl TrayCoordinatorHandle {
         }
     }
 
+    fn host_resume(&self) {
+        if tray_exit_requested() || !tray_desired_on() {
+            return;
+        }
+        let _ = self.sender.send(TrayCoordinatorRequest::HostResume);
+    }
+
     fn exit(&self) {
         TRAY_INTENT.store(TRAY_INTENT_EXITING, Ordering::Release);
         let _ = self.sender.send(TrayCoordinatorRequest::Exit);
@@ -1882,6 +1924,13 @@ async fn run_tray_coordinator<B>(
             TrayCoordinatorRequest::Wake { report_stop_error } => {
                 report_next_stop_error |= report_stop_error;
             }
+            TrayCoordinatorRequest::HostResume => {
+                if let Err(error) = backend.host_resume().await {
+                    backend.report_error(format!(
+                        "The wired link could not recover after Windows resumed: {error:#}"
+                    ));
+                }
+            }
             TrayCoordinatorRequest::Diagnose => {
                 if let Err(error) = backend.diagnose().await {
                     backend.report_error(format!("Diagnose and fix could not finish: {error:#}"));
@@ -1936,6 +1985,15 @@ const TRAY_EXIT_COMPLETE_MESSAGE: u32 = 0x8000 + 43;
 const TRAY_ERROR_MESSAGE: u32 = 0x8000 + 44;
 #[cfg(target_os = "windows")]
 const TRAY_ICON_TIMER_ID: usize = 41;
+#[cfg(any(target_os = "windows", test))]
+const WINDOWS_WM_POWERBROADCAST: u32 = 0x0218;
+#[cfg(any(target_os = "windows", test))]
+const WINDOWS_PBT_APMRESUMEAUTOMATIC: usize = 0x0012;
+
+#[cfg(any(target_os = "windows", test))]
+fn windows_power_event_is_resume(message: u32, wparam: usize) -> bool {
+    message == WINDOWS_WM_POWERBROADCAST && wparam == WINDOWS_PBT_APMRESUMEAUTOMATIC
+}
 
 #[cfg(target_os = "windows")]
 struct TrayInstance {
@@ -2132,6 +2190,12 @@ fn run_windows_tray(
         lparam: LPARAM,
     ) -> LRESULT {
         match message {
+            message if windows_power_event_is_resume(message, wparam) => {
+                if let Some(coordinator) = WINDOWS_TRAY_COORDINATOR.get() {
+                    coordinator.host_resume();
+                }
+                1
+            }
             TRAY_CALLBACK_MESSAGE => {
                 if matches!(lparam as u32, WM_RBUTTONUP | WM_LBUTTONDBLCLK) {
                     show_menu(hwnd);
@@ -2565,6 +2629,7 @@ mod tests {
         outcomes: StdMutex<std::collections::VecDeque<FakeReconcileOutcome>>,
         calls: StdMutex<Vec<Instant>>,
         errors: StdMutex<Vec<String>>,
+        resume_calls: std::sync::atomic::AtomicUsize,
         active: std::sync::atomic::AtomicUsize,
         max_active: std::sync::atomic::AtomicUsize,
         operation_delay: Duration,
@@ -2593,6 +2658,7 @@ mod tests {
                     outcomes: StdMutex::new(outcomes.into_iter().collect()),
                     calls: StdMutex::new(Vec::new()),
                     errors: StdMutex::new(Vec::new()),
+                    resume_calls: std::sync::atomic::AtomicUsize::new(0),
                     active: std::sync::atomic::AtomicUsize::new(0),
                     max_active: std::sync::atomic::AtomicUsize::new(0),
                     operation_delay,
@@ -2606,6 +2672,13 @@ mod tests {
     }
 
     impl TrayCoordinatorBackend for FakeTrayBackend {
+        fn host_resume(&self) -> TrayCoordinatorFuture<'_, Result<()>> {
+            Box::pin(async move {
+                self.inner.resume_calls.fetch_add(1, Ordering::AcqRel);
+                Ok(())
+            })
+        }
+
         fn diagnose(&self) -> TrayCoordinatorFuture<'_, Result<()>> {
             Box::pin(async { Ok(()) })
         }
@@ -2677,6 +2750,35 @@ mod tests {
         worker.await.unwrap();
         assert_eq!(inspect.inner.max_active.load(Ordering::Acquire), 1);
         assert!(inspect.inner.errors.lock().unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn tray_coordinator_dispatches_host_resume_before_reconciliation() {
+        let backend = FakeTrayBackend::new([true], Duration::ZERO);
+        let inspect = backend.clone();
+        let (sender, receiver) = tokio::sync::mpsc::unbounded_channel();
+        let worker = tokio::spawn(run_tray_coordinator(receiver, backend));
+        sender.send(TrayCoordinatorRequest::HostResume).unwrap();
+        tokio::time::timeout(Duration::from_secs(1), async {
+            while inspect.inner.resume_calls.load(Ordering::Acquire) == 0
+                || inspect.call_times().is_empty()
+            {
+                tokio::time::sleep(Duration::from_millis(1)).await;
+            }
+        })
+        .await
+        .unwrap();
+        drop(sender);
+        worker.await.unwrap();
+        assert_eq!(inspect.inner.resume_calls.load(Ordering::Acquire), 1);
+        assert_eq!(inspect.call_times().len(), 1);
+    }
+
+    #[test]
+    fn only_automatic_windows_resume_requests_recovery() {
+        assert!(windows_power_event_is_resume(0x0218, 0x0012));
+        assert!(!windows_power_event_is_resume(0x0218, 0x0007));
+        assert!(!windows_power_event_is_resume(0x000F, 0x0012));
     }
 
     #[tokio::test]

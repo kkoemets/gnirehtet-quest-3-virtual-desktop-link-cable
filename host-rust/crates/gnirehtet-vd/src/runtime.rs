@@ -50,6 +50,10 @@ use crate::{
 const MAX_ADMIN_MESSAGE: usize = 4 * 1024;
 const MAX_ADMIN_CONNECTIONS: usize = 8;
 const ADMIN_IO_TIMEOUT: Duration = Duration::from_secs(3);
+const HOST_RESUME_RECOVERY_REASON: &str =
+    "Windows resumed; rebuilding the wired transport generation";
+const HOST_RESUME_MAX_ATTEMPTS: u32 = 2;
+const HOST_RESUME_RETRY_DELAY: Duration = Duration::from_secs(1);
 
 #[derive(Clone, Debug)]
 pub struct AppPaths {
@@ -306,7 +310,29 @@ pub struct AdbMonitorSnapshot {
     pub mapping_probe_last_us: u64,
     #[serde(default)]
     pub mapping_probe_max_us: u64,
+    #[serde(default)]
+    pub host_resume: HostResumeRecoverySnapshot,
     pub last_error: Option<String>,
+}
+
+#[derive(Clone, Copy, Debug, Default, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum HostResumeRecoveryState {
+    #[default]
+    Idle,
+    Pending,
+    WaitingForDevice,
+    RebuildingMappings,
+    AwaitingControl,
+    Recovered,
+    Failed,
+}
+
+#[derive(Clone, Copy, Debug, Default, Deserialize, Eq, PartialEq, Serialize)]
+pub struct HostResumeRecoverySnapshot {
+    pub generation: u64,
+    pub attempt: u32,
+    pub state: HostResumeRecoveryState,
 }
 
 #[derive(Clone, Default)]
@@ -317,6 +343,7 @@ pub struct AdbHealthMonitor {
     mapping_probe_count: Arc<AtomicU64>,
     mapping_probe_last_us: Arc<AtomicU64>,
     mapping_probe_max_us: Arc<AtomicU64>,
+    host_resume: Arc<StdMutex<HostResumeRecoverySnapshot>>,
     status: Arc<StdMutex<AdbMonitorSnapshot>>,
     operation: Arc<Mutex<()>>,
     changed: Arc<Notify>,
@@ -455,7 +482,124 @@ impl AdbHealthMonitor {
         snapshot.mapping_probe_count = self.mapping_probe_count.load(Ordering::Relaxed);
         snapshot.mapping_probe_last_us = self.mapping_probe_last_us.load(Ordering::Relaxed);
         snapshot.mapping_probe_max_us = self.mapping_probe_max_us.load(Ordering::Relaxed);
+        snapshot.host_resume = self.host_resume_snapshot();
         snapshot
+    }
+
+    fn host_resume_snapshot(&self) -> HostResumeRecoverySnapshot {
+        self.host_resume
+            .lock()
+            .map(|state| *state)
+            .unwrap_or_default()
+    }
+
+    fn sync_host_resume_status(&self, last_error: Option<String>) {
+        let resume = self.host_resume_snapshot();
+        if let Ok(mut status) = self.status.lock() {
+            status.host_resume = resume;
+            status.last_error = last_error;
+            if matches!(
+                resume.state,
+                HostResumeRecoveryState::Pending
+                    | HostResumeRecoveryState::WaitingForDevice
+                    | HostResumeRecoveryState::RebuildingMappings
+                    | HostResumeRecoveryState::Failed
+            ) {
+                status.mappings_healthy = false;
+            }
+        }
+    }
+
+    pub fn notify_host_resume(&self) -> u64 {
+        let generation = if let Ok(mut resume) = self.host_resume.lock() {
+            resume.generation = resume.generation.wrapping_add(1);
+            resume.attempt = 0;
+            resume.state = HostResumeRecoveryState::Pending;
+            resume.generation
+        } else {
+            0
+        };
+        self.sync_host_resume_status(Some("host_resume_recovery_pending".into()));
+        self.changed.notify_one();
+        generation
+    }
+
+    fn host_resume_requires_recovery(&self) -> bool {
+        matches!(
+            self.host_resume_snapshot().state,
+            HostResumeRecoveryState::Pending
+                | HostResumeRecoveryState::WaitingForDevice
+                | HostResumeRecoveryState::RebuildingMappings
+                | HostResumeRecoveryState::Failed
+        )
+    }
+
+    fn wait_for_resume_device(&self) {
+        if let Ok(mut resume) = self.host_resume.lock() {
+            resume.attempt = 0;
+            resume.state = HostResumeRecoveryState::WaitingForDevice;
+        }
+        self.sync_host_resume_status(Some("host_resume_waiting_for_device".into()));
+    }
+
+    fn begin_host_resume_attempt(&self) -> Option<(u64, u32)> {
+        let attempt = if let Ok(mut resume) = self.host_resume.lock() {
+            if !matches!(
+                resume.state,
+                HostResumeRecoveryState::Pending | HostResumeRecoveryState::WaitingForDevice
+            ) || resume.attempt >= HOST_RESUME_MAX_ATTEMPTS
+            {
+                return None;
+            }
+            resume.attempt += 1;
+            resume.state = HostResumeRecoveryState::RebuildingMappings;
+            (resume.generation, resume.attempt)
+        } else {
+            return None;
+        };
+        self.sync_host_resume_status(Some("host_resume_rebuilding_mappings".into()));
+        Some(attempt)
+    }
+
+    fn finish_host_resume_attempt(&self, generation: u64, succeeded: bool) -> bool {
+        let mut retry = false;
+        if let Ok(mut resume) = self.host_resume.lock() {
+            if resume.generation != generation {
+                return false;
+            }
+            if succeeded {
+                resume.state = HostResumeRecoveryState::AwaitingControl;
+            } else if resume.attempt < HOST_RESUME_MAX_ATTEMPTS {
+                resume.state = HostResumeRecoveryState::Pending;
+                retry = true;
+            } else {
+                resume.state = HostResumeRecoveryState::Failed;
+            }
+        }
+        self.sync_host_resume_status((!succeeded).then(|| {
+            if retry {
+                "host_resume_mapping_rebuild_retry".into()
+            } else {
+                "host_resume_mapping_rebuild_failed".into()
+            }
+        }));
+        retry
+    }
+
+    fn finish_host_resume_control(&self) {
+        let recovered = if let Ok(mut resume) = self.host_resume.lock() {
+            if resume.state == HostResumeRecoveryState::AwaitingControl {
+                resume.state = HostResumeRecoveryState::Recovered;
+                true
+            } else {
+                false
+            }
+        } else {
+            false
+        };
+        if recovered {
+            self.sync_host_resume_status(None);
+        }
     }
 
     fn record_mapping_probe(&self, duration: Duration) {
@@ -496,6 +640,7 @@ impl AdbHealthMonitor {
     }
 
     pub fn notify_authenticated_connection(&self) {
+        self.finish_host_resume_control();
         self.authenticated_reconcile.store(true, Ordering::Release);
         self.changed.notify_one();
     }
@@ -572,16 +717,25 @@ impl AdbHealthMonitor {
                                     let forced = self
                                         .authenticated_reconcile
                                         .swap(false, Ordering::AcqRel);
-                                    self.reconcile(
+                                    if !self.recover_host_resume(
                                         &adb,
                                         &control,
                                         &store,
                                         &diagnostics,
                                         &relay_gate,
-                                        available || forced,
-                                    ).await;
-                                    if forced {
-                                        self.retry_authenticated_reconcile_if_needed();
+                                        available,
+                                    ).await {
+                                        self.reconcile(
+                                            &adb,
+                                            &control,
+                                            &store,
+                                            &diagnostics,
+                                            &relay_gate,
+                                            available || forced,
+                                        ).await;
+                                        if forced {
+                                            self.retry_authenticated_reconcile_if_needed();
+                                        }
                                     }
                                 }
                             }
@@ -605,7 +759,16 @@ impl AdbHealthMonitor {
                         let forced = self
                             .authenticated_reconcile
                             .swap(false, Ordering::AcqRel);
-                        if should_reconcile_on_healthy_tick(
+                        if self.host_resume_requires_recovery() {
+                            self.recover_host_resume(
+                                &adb,
+                                &control,
+                                &store,
+                                &diagnostics,
+                                &relay_gate,
+                                cached_device_is_available(device_available),
+                            ).await;
+                        } else if should_reconcile_on_healthy_tick(
                             forced,
                             device_available,
                             self.snapshot().mappings_healthy,
@@ -630,7 +793,16 @@ impl AdbHealthMonitor {
                         let forced = self
                             .authenticated_reconcile
                             .swap(false, Ordering::AcqRel);
-                        if forced || cached_device_is_available(device_available) {
+                        if self.host_resume_requires_recovery() {
+                            self.recover_host_resume(
+                                &adb,
+                                &control,
+                                &store,
+                                &diagnostics,
+                                &relay_gate,
+                                cached_device_is_available(device_available),
+                            ).await;
+                        } else if forced || cached_device_is_available(device_available) {
                             self.reconcile(
                                 &adb,
                                 &control,
@@ -675,6 +847,116 @@ impl AdbHealthMonitor {
             time::sleep(Duration::from_millis(100)).await;
             changed.notify_one();
         });
+    }
+
+    async fn recover_host_resume(
+        &self,
+        adb: &AdbController,
+        control: &ControlHandle,
+        store: &StateStore,
+        diagnostics: &Diagnostics,
+        relay_gate: &RelayGateController,
+        device_available: bool,
+    ) -> bool {
+        if !self.host_resume_requires_recovery() {
+            return false;
+        }
+        relay_gate.carrier_lost();
+        if self.stopping.load(Ordering::Acquire) {
+            return true;
+        }
+        if !device_available {
+            self.wait_for_resume_device();
+            self.update_status(
+                true,
+                false,
+                false,
+                Some("host_resume_waiting_for_device".into()),
+            );
+            return true;
+        }
+        let Some((resume_generation, attempt)) = self.begin_host_resume_attempt() else {
+            return true;
+        };
+        self.update_status(
+            true,
+            true,
+            false,
+            Some("host_resume_rebuilding_mappings".into()),
+        );
+        let _ = diagnostics.record(
+            "host_resume_recovery_attempt",
+            json!({
+                "generation": resume_generation,
+                "attempt": attempt,
+            }),
+        );
+
+        let _operation = self.operation.lock().await;
+        if self.stopping.load(Ordering::Acquire) {
+            return true;
+        }
+        let recovery_adb = adb.clone();
+        let result = task::spawn_blocking(move || recovery_adb.reinstall_mappings()).await;
+        if self.host_resume_snapshot().generation != resume_generation {
+            return true;
+        }
+        match result {
+            Ok(Ok(())) => {
+                // A control connection can race mapping recreation. Cancel it
+                // after the fresh listeners are installed so only a HELLO from
+                // this resume generation can reopen the relay.
+                relay_gate.control_inactive();
+                let snapshot = control.reset_transport(HOST_RESUME_RECOVERY_REASON).await;
+                let _ = store.write(&snapshot, Some(std::process::id()));
+                let reconnect_generation = self
+                    .reconnect_generation
+                    .fetch_add(1, Ordering::Relaxed)
+                    .saturating_add(1);
+                self.finish_host_resume_attempt(resume_generation, true);
+                self.update_status(true, true, true, None);
+                relay_gate.carrier_healthy();
+                let _ = diagnostics.record(
+                    "host_resume_recovery_ready",
+                    json!({
+                        "generation": resume_generation,
+                        "attempt": attempt,
+                        "reconnect_generation": reconnect_generation,
+                        "waiting_for": "authenticated_control",
+                    }),
+                );
+            }
+            Ok(Err(_)) | Err(_) => {
+                let retry = self.finish_host_resume_attempt(resume_generation, false);
+                self.update_status(
+                    true,
+                    true,
+                    false,
+                    Some(if retry {
+                        "host_resume_mapping_rebuild_retry".into()
+                    } else {
+                        "host_resume_mapping_rebuild_failed".into()
+                    }),
+                );
+                let _ = diagnostics.record(
+                    "host_resume_recovery_failed",
+                    json!({
+                        "generation": resume_generation,
+                        "attempt": attempt,
+                        "will_retry": retry,
+                        "category": "mapping_rebuild",
+                    }),
+                );
+                if retry {
+                    let changed = self.changed.clone();
+                    tokio::spawn(async move {
+                        time::sleep(HOST_RESUME_RETRY_DELAY).await;
+                        changed.notify_one();
+                    });
+                }
+            }
+        }
+        true
     }
 
     async fn reconcile(
@@ -868,6 +1150,7 @@ impl AdbHealthMonitor {
                 mapping_probe_count: self.mapping_probe_count.load(Ordering::Relaxed),
                 mapping_probe_last_us: self.mapping_probe_last_us.load(Ordering::Relaxed),
                 mapping_probe_max_us: self.mapping_probe_max_us.load(Ordering::Relaxed),
+                host_resume: self.host_resume_snapshot(),
                 last_error,
             };
             let changed = *status != next;
@@ -1459,6 +1742,9 @@ fn flatten_runtime_task(
 fn update_relay_gate(relay_gate: &RelayGateController, snapshot: &StateSnapshot) {
     match snapshot.state {
         HostState::Connected => relay_gate.control_connected(),
+        HostState::Degraded if snapshot.reason.as_deref() == Some(HOST_RESUME_RECOVERY_REASON) => {
+            relay_gate.carrier_lost();
+        }
         HostState::Degraded
             if snapshot.reason.as_deref() == Some(CONTROL_TRANSPORT_LOST_REASON) =>
         {
@@ -1632,6 +1918,23 @@ impl AdminServer {
             return Ok(());
         }
         let response = match request.command.as_str() {
+            "host_resume" => {
+                let status = self.control.snapshot().await;
+                let status = if matches!(status.state, HostState::Connected | HostState::Degraded) {
+                    self.adb_monitor.notify_host_resume();
+                    self.control
+                        .reset_transport(HOST_RESUME_RECOVERY_REASON)
+                        .await
+                } else {
+                    status
+                };
+                AdminResponse {
+                    ok: true,
+                    repairs_suppressed: false,
+                    error: None,
+                    status: Some(status),
+                }
+            }
             "stop" => {
                 // Stop new mapping work first, then send STOP immediately so
                 // Android can close the VPN descriptor without waiting behind
@@ -2525,9 +2828,15 @@ mod tests {
                 }
                 return Ok(AdbOutput::success(""));
             }
-            if args.get(1).is_some_and(|argument| argument == "reverse")
-                && !args.iter().any(|argument| argument == "--remove")
-            {
+            if args.iter().any(|argument| argument == "--remove") {
+                let _ =
+                    self.mapping_adds
+                        .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |count| {
+                            Some(count.saturating_sub(1))
+                        });
+                return Ok(AdbOutput::success(""));
+            }
+            if args.get(1).is_some_and(|argument| argument == "reverse") {
                 self.mapping_adds.fetch_add(1, Ordering::Relaxed);
                 std::thread::sleep(Duration::from_millis(
                     self.mapping_delay_ms.load(Ordering::Relaxed),
@@ -3003,6 +3312,92 @@ mod tests {
         relay_controller.control_connected();
         assert!(relay_gate.is_enabled());
         assert!(relay_gate.generation() > suspended_generation);
+    }
+
+    #[test]
+    fn host_resume_recovery_is_bounded_to_two_attempts() {
+        let monitor = AdbHealthMonitor::default();
+        let generation = monitor.notify_host_resume();
+        assert_eq!(generation, 1);
+        assert_eq!(monitor.begin_host_resume_attempt(), Some((1, 1)));
+        assert!(monitor.finish_host_resume_attempt(1, false));
+        assert_eq!(monitor.begin_host_resume_attempt(), Some((1, 2)));
+        assert!(!monitor.finish_host_resume_attempt(1, false));
+        assert_eq!(monitor.begin_host_resume_attempt(), None);
+        assert_eq!(
+            monitor.snapshot().host_resume.state,
+            HostResumeRecoveryState::Failed
+        );
+    }
+
+    #[tokio::test]
+    async fn host_resume_rebuilds_mappings_before_waiting_for_fresh_control() {
+        let directory = tempfile::tempdir().unwrap();
+        let paths = AppPaths::discover(Some(directory.path().to_owned())).unwrap();
+        let diagnostics = Diagnostics::open(&paths.logs).unwrap();
+        let store = StateStore::new(&paths.status);
+        let session = SessionId([0x75; 16]);
+        let control = ControlServer::new(ControlConfig {
+            bind: "127.0.0.1:0".parse().unwrap(),
+            session_id: session,
+        })
+        .unwrap();
+        control
+            .state()
+            .lock()
+            .await
+            .peer_started(session, std::time::Instant::now())
+            .unwrap();
+        let executor = Arc::new(MonitorMockAdb::default());
+        executor
+            .mapping_adds
+            .store(REVERSE_MAPPINGS.len() as u64, Ordering::Relaxed);
+        let adb = AdbController::new(executor.clone());
+        let monitor = AdbHealthMonitor::default();
+        let relay_gate = RelayGate::default();
+        let relay_controller = RelayGateController::new(relay_gate.clone());
+        relay_controller.control_connected();
+        assert!(relay_gate.is_enabled());
+
+        monitor.notify_host_resume();
+        assert!(
+            monitor
+                .recover_host_resume(
+                    &adb,
+                    &control.command_handle(),
+                    &store,
+                    &diagnostics,
+                    &relay_controller,
+                    true,
+                )
+                .await
+        );
+
+        let snapshot = monitor.snapshot();
+        assert_eq!(snapshot.reconnect_generation, 1);
+        assert!(snapshot.mappings_healthy);
+        assert_eq!(
+            snapshot.host_resume.state,
+            HostResumeRecoveryState::AwaitingControl
+        );
+        assert!(!relay_gate.is_enabled());
+        let calls = executor.calls.lock().unwrap();
+        assert_eq!(
+            calls
+                .iter()
+                .filter(|args| args.iter().any(|argument| argument == "--remove"))
+                .count(),
+            REVERSE_MAPPINGS.len()
+        );
+        drop(calls);
+
+        monitor.notify_authenticated_connection();
+        relay_controller.control_connected();
+        assert_eq!(
+            monitor.snapshot().host_resume.state,
+            HostResumeRecoveryState::Recovered
+        );
+        assert!(relay_gate.is_enabled());
     }
 
     #[tokio::test]

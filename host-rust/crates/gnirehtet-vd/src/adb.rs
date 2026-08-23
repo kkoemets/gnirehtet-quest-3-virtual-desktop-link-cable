@@ -647,6 +647,12 @@ impl AdbController {
         self.require_device()
             .map_err(|failure| TransactionError::single("device_check", failure))?;
 
+        // A host process can disappear after Android has committed its VPN
+        // session and reverse mappings. Reusing those mappings lets the old
+        // control loop keep presenting its stale session ID to a fresh daemon,
+        // so make every new host session begin from a verified Android stop.
+        self.stop_android_session("start_quiesce")?;
+
         let mut failures = Vec::new();
         for mapping in REVERSE_MAPPINGS {
             if let Err(error) = self.add_mapping(mapping) {
@@ -744,6 +750,10 @@ impl AdbController {
     pub fn stop(&self) -> Result<(), TransactionError> {
         self.require_device()
             .map_err(|failure| TransactionError::single("stop", failure))?;
+        self.stop_android_session("stop")
+    }
+
+    fn stop_android_session(&self, phase: &'static str) -> Result<(), TransactionError> {
         let mut failures = Vec::new();
         let args = strings(&[
             "-d",
@@ -767,7 +777,7 @@ impl AdbController {
         if failures.is_empty() {
             Ok(())
         } else {
-            Err(TransactionError::new("stop", failures))
+            Err(TransactionError::new(phase, failures))
         }
     }
 
@@ -776,6 +786,43 @@ impl AdbController {
             .mapping_health()
             .map_err(|failure| TransactionError::single("repair_probe", failure))?;
         self.repair_missing_mappings(&health.missing)
+    }
+
+    /// Recreates every product-owned reverse mapping even when ADB still
+    /// reports the old listeners after a host sleep/resume cycle. Established
+    /// sockets can outlive those listener records, so resume recovery needs a
+    /// fresh mapping generation rather than a presence-only repair.
+    pub fn reinstall_mappings(&self) -> Result<(), TransactionError> {
+        let mut failures = Vec::new();
+        self.remove_all_mappings(&mut failures);
+        if !failures.is_empty() {
+            return Err(TransactionError::new("resume_reverse_remove", failures));
+        }
+
+        for mapping in REVERSE_MAPPINGS {
+            if let Err(error) = self.add_mapping(mapping) {
+                failures.push(error.to_string());
+                break;
+            }
+        }
+        if failures.is_empty() {
+            match self.mapping_health() {
+                Ok(health) if health.is_healthy() => {}
+                Ok(health) => failures.push(format!(
+                    "reverse mappings missing after reinstall: {:?}",
+                    health.missing
+                )),
+                Err(error) => {
+                    failures.push(format!("reverse mapping verification failed: {error}"))
+                }
+            }
+        }
+        if failures.is_empty() {
+            Ok(())
+        } else {
+            self.remove_all_mappings(&mut failures);
+            Err(TransactionError::new("resume_reverse_setup", failures))
+        }
     }
 
     pub fn repair_missing_mappings(
@@ -1378,14 +1425,22 @@ mod tests {
         let mock = Arc::new(MockAdb::with_results(vec![
             Ok(AdbOutput::success("device")),
             Ok(AdbOutput::success("")),
+            Ok(AdbOutput::success("No services match")),
+            Ok(AdbOutput::success("")),
+            Ok(AdbOutput::success("")),
+            Ok(AdbOutput::success("")),
+            Ok(AdbOutput::success("")),
+            Ok(AdbOutput::success("")),
             Ok(AdbOutput {
                 status: 1,
                 stdout: String::new(),
                 stderr: "reverse refused".into(),
             }),
         ]));
-        let result = controller(mock.clone()).start(SessionId([7; 16]), false);
-        assert!(result.is_err());
+        let error = controller(mock.clone())
+            .start(SessionId([7; 16]), false)
+            .unwrap_err();
+        assert_eq!(error.phase, "reverse_setup");
         let calls = mock.calls.lock().unwrap();
         for mapping in REVERSE_MAPPINGS {
             assert!(calls.iter().any(|args| {
@@ -1453,24 +1508,39 @@ mod tests {
     #[test]
     fn start_uses_the_android_v4_all_traffic_contract() {
         let mock = Arc::new(MockAdb::with_results(vec![
-            Ok(AdbOutput::success("device")),
-            Ok(AdbOutput::success("")),
-            Ok(AdbOutput::success("")),
-            Ok(AdbOutput::success("")),
+            Ok(AdbOutput::success("device")),             // device check
+            Ok(AdbOutput::success("")),                   // stale STOP
+            Ok(AdbOutput::success("No services match")),  // VPN closed
+            Ok(AdbOutput::success("")),                   // remove SOCKS
+            Ok(AdbOutput::success("")),                   // remove UDP
+            Ok(AdbOutput::success("")),                   // remove control
+            Ok(AdbOutput::success("")),                   // verify removed
+            Ok(AdbOutput::success("")),                   // add SOCKS
+            Ok(AdbOutput::success("")),                   // add UDP
+            Ok(AdbOutput::success("")),                   // add control
             Ok(AdbOutput::success(
                 "UsbFfs tcp:31417 tcp:31417\nUsbFfs tcp:31416 tcp:31416\nUsbFfs tcp:31418 tcp:31418\n",
-            )),
-            Ok(AdbOutput::success("Starting")),
+            )), // verify mappings
+            Ok(AdbOutput::success("Starting")), // fresh START
         ]));
         let receipt = AdbController::new(mock.clone())
             .start(SessionId([0x11; 16]), true)
             .unwrap();
         assert_eq!(receipt.allowed_package, VIRTUAL_DESKTOP_PACKAGE);
         let calls = mock.calls.lock().unwrap();
+        let stop_index = calls
+            .iter()
+            .position(|args| args.iter().any(|arg| arg == ACTION_STOP_V4))
+            .unwrap();
         let start = calls
             .iter()
             .find(|args| args.iter().any(|arg| arg == ACTION_START_V4))
             .unwrap();
+        let start_index = calls
+            .iter()
+            .position(|args| args.iter().any(|arg| arg == ACTION_START_V4))
+            .unwrap();
+        assert!(stop_index < start_index);
         for required in [
             ANDROID_CONTROL_ACTIVITY,
             "sessionId",
@@ -1698,6 +1768,44 @@ mod tests {
             "UsbFfs tcp:31416 tcp:31416\nUsbFfs tcp:31417 tcp:31417\nUsbFfs tcp:31418 tcp:31418\n";
         let mock = Arc::new(MockAdb::with_results(vec![Ok(AdbOutput::success(stdout))]));
         assert!(controller(mock).mapping_health().unwrap().is_healthy());
+    }
+
+    #[test]
+    fn resume_reinstall_removes_then_recreates_every_owned_mapping() {
+        let mappings =
+            "UsbFfs tcp:31416 tcp:31416\nUsbFfs tcp:31417 tcp:31417\nUsbFfs tcp:31418 tcp:31418\n";
+        let mock = Arc::new(MockAdb::with_results(vec![
+            Ok(AdbOutput::success("")),
+            Ok(AdbOutput::success("")),
+            Ok(AdbOutput::success("")),
+            Ok(AdbOutput::success("")),
+            Ok(AdbOutput::success("")),
+            Ok(AdbOutput::success("")),
+            Ok(AdbOutput::success("")),
+            Ok(AdbOutput::success(mappings)),
+        ]));
+
+        controller(mock.clone()).reinstall_mappings().unwrap();
+
+        let calls = mock.calls.lock().unwrap();
+        let remove_positions: Vec<_> = calls
+            .iter()
+            .enumerate()
+            .filter_map(|(index, args)| args.iter().any(|arg| arg == "--remove").then_some(index))
+            .collect();
+        let add_positions: Vec<_> = calls
+            .iter()
+            .enumerate()
+            .filter_map(|(index, args)| {
+                (args.get(1).is_some_and(|arg| arg == "reverse")
+                    && !args.iter().any(|arg| arg == "--remove")
+                    && !args.iter().any(|arg| arg == "--list"))
+                .then_some(index)
+            })
+            .collect();
+        assert_eq!(remove_positions.len(), REVERSE_MAPPINGS.len());
+        assert_eq!(add_positions.len(), REVERSE_MAPPINGS.len());
+        assert!(remove_positions.iter().max() < add_positions.iter().min());
     }
 
     #[test]
