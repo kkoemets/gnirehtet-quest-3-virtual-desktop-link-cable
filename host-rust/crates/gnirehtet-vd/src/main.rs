@@ -130,6 +130,8 @@ enum DiagnosticsCommand {
 struct DaemonArgs {
     #[arg(long)]
     session: SessionId,
+    #[arg(long)]
+    all_traffic: bool,
 }
 
 #[tokio::main(flavor = "multi_thread", worker_threads = 2)]
@@ -145,7 +147,9 @@ async fn main() -> Result<()> {
 
     match cli.command {
         None => no_argument_entry(paths, adb_program, adb).await,
-        Some(Command::Daemon(args)) => run_foreground(args.session, paths, adb, adb_program).await,
+        Some(Command::Daemon(args)) => {
+            run_foreground(args.session, args.all_traffic, paths, adb, adb_program).await
+        }
         Some(command) => {
             #[cfg(target_os = "windows")]
             {
@@ -817,13 +821,20 @@ fn emit_broker_response(response: BrokerResponse) -> Result<()> {
 
 async fn run_foreground(
     session_id: SessionId,
+    all_traffic: bool,
     paths: AppPaths,
     adb: AdbController,
     adb_program: PathBuf,
 ) -> Result<()> {
-    HostRuntime::new(RuntimeConfig::new(session_id, paths, adb, adb_program))?
-        .run()
-        .await?;
+    HostRuntime::new(RuntimeConfig::new(
+        session_id,
+        all_traffic,
+        paths,
+        adb,
+        adb_program,
+    ))?
+    .run()
+    .await?;
     Ok(())
 }
 
@@ -845,14 +856,14 @@ async fn start(
     embedded::materialize(&apk_path)?;
     adb.install_matching_apk(&apk_path)?;
     let session = SessionId::random();
-    let mut daemon = spawn_daemon(daemon_adb, paths, session)?;
+    let all_traffic = args.routes_all_traffic();
+    let mut daemon = spawn_daemon(daemon_adb, paths, session, all_traffic)?;
     let daemon_pid = daemon.id();
     if let Err(error) = wait_for_runtime_ready(paths, daemon_pid).await {
         let _ = terminate_spawned_daemon(&mut daemon);
         return Err(error);
     }
 
-    let all_traffic = args.routes_all_traffic();
     let start_result = adb.start(session, all_traffic);
     if let Err(error) = start_result {
         let _ = terminate_spawned_daemon(&mut daemon);
@@ -1153,7 +1164,12 @@ async fn diagnostics(
     }
 }
 
-fn spawn_daemon(adb: &std::path::Path, paths: &AppPaths, session: SessionId) -> Result<Child> {
+fn spawn_daemon(
+    adb: &std::path::Path,
+    paths: &AppPaths,
+    session: SessionId,
+    all_traffic: bool,
+) -> Result<Child> {
     let executable = std::env::current_exe().context("locating current executable")?;
     let mut command = ProcessCommand::new(executable);
     command
@@ -1161,7 +1177,11 @@ fn spawn_daemon(adb: &std::path::Path, paths: &AppPaths, session: SessionId) -> 
         .arg(&paths.root)
         .arg("daemon")
         .arg("--session")
-        .arg(session.to_string())
+        .arg(session.to_string());
+    if all_traffic {
+        command.arg("--all-traffic");
+    }
+    command
         .arg("--adb")
         .arg(adb)
         .stdin(Stdio::null())
@@ -2889,6 +2909,7 @@ mod tests {
         );
         assert!(BrokerCommand::try_from(Command::Daemon(DaemonArgs {
             session: SessionId([0x11; 16]),
+            all_traffic: false,
         }))
         .is_err());
         assert!(BrokerCommand::DiagnosticsCapture { duration: 0 }

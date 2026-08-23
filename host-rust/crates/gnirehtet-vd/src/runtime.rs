@@ -50,10 +50,9 @@ use crate::{
 const MAX_ADMIN_MESSAGE: usize = 4 * 1024;
 const MAX_ADMIN_CONNECTIONS: usize = 8;
 const ADMIN_IO_TIMEOUT: Duration = Duration::from_secs(3);
-const HOST_RESUME_RECOVERY_REASON: &str =
-    "Windows resumed; rebuilding the wired transport generation";
-const HOST_RESUME_MAX_ATTEMPTS: u32 = 2;
-const HOST_RESUME_RETRY_DELAY: Duration = Duration::from_secs(1);
+const TRANSPORT_RECOVERY_REASON: &str = "rebuilding the wired transport generation";
+const TRANSPORT_RECOVERY_MAX_ATTEMPTS: u32 = 2;
+const TRANSPORT_RECOVERY_RETRY_DELAY: Duration = Duration::from_secs(1);
 
 #[derive(Clone, Debug)]
 pub struct AppPaths {
@@ -311,13 +310,13 @@ pub struct AdbMonitorSnapshot {
     #[serde(default)]
     pub mapping_probe_max_us: u64,
     #[serde(default)]
-    pub host_resume: HostResumeRecoverySnapshot,
+    pub transport_recovery: TransportRecoverySnapshot,
     pub last_error: Option<String>,
 }
 
 #[derive(Clone, Copy, Debug, Default, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(rename_all = "snake_case")]
-pub enum HostResumeRecoveryState {
+pub enum TransportRecoveryState {
     #[default]
     Idle,
     Pending,
@@ -328,11 +327,19 @@ pub enum HostResumeRecoveryState {
     Failed,
 }
 
+#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum TransportRecoveryTrigger {
+    HostResume,
+    UsbReconnect,
+}
+
 #[derive(Clone, Copy, Debug, Default, Deserialize, Eq, PartialEq, Serialize)]
-pub struct HostResumeRecoverySnapshot {
+pub struct TransportRecoverySnapshot {
     pub generation: u64,
     pub attempt: u32,
-    pub state: HostResumeRecoveryState,
+    pub state: TransportRecoveryState,
+    pub trigger: Option<TransportRecoveryTrigger>,
 }
 
 #[derive(Clone, Default)]
@@ -343,10 +350,19 @@ pub struct AdbHealthMonitor {
     mapping_probe_count: Arc<AtomicU64>,
     mapping_probe_last_us: Arc<AtomicU64>,
     mapping_probe_max_us: Arc<AtomicU64>,
-    host_resume: Arc<StdMutex<HostResumeRecoverySnapshot>>,
+    transport_recovery: Arc<StdMutex<TransportRecoverySnapshot>>,
+    usb_reconnect_pending: Arc<AtomicBool>,
     status: Arc<StdMutex<AdbMonitorSnapshot>>,
     operation: Arc<Mutex<()>>,
     changed: Arc<Notify>,
+}
+
+#[derive(Clone)]
+struct AdbMonitorConfig {
+    adb: AdbController,
+    adb_program: PathBuf,
+    session_id: SessionId,
+    all_traffic: bool,
 }
 
 #[derive(Clone, Copy)]
@@ -482,28 +498,28 @@ impl AdbHealthMonitor {
         snapshot.mapping_probe_count = self.mapping_probe_count.load(Ordering::Relaxed);
         snapshot.mapping_probe_last_us = self.mapping_probe_last_us.load(Ordering::Relaxed);
         snapshot.mapping_probe_max_us = self.mapping_probe_max_us.load(Ordering::Relaxed);
-        snapshot.host_resume = self.host_resume_snapshot();
+        snapshot.transport_recovery = self.transport_recovery_snapshot();
         snapshot
     }
 
-    fn host_resume_snapshot(&self) -> HostResumeRecoverySnapshot {
-        self.host_resume
+    fn transport_recovery_snapshot(&self) -> TransportRecoverySnapshot {
+        self.transport_recovery
             .lock()
             .map(|state| *state)
             .unwrap_or_default()
     }
 
-    fn sync_host_resume_status(&self, last_error: Option<String>) {
-        let resume = self.host_resume_snapshot();
+    fn sync_transport_recovery_status(&self, last_error: Option<String>) {
+        let recovery = self.transport_recovery_snapshot();
         if let Ok(mut status) = self.status.lock() {
-            status.host_resume = resume;
+            status.transport_recovery = recovery;
             status.last_error = last_error;
             if matches!(
-                resume.state,
-                HostResumeRecoveryState::Pending
-                    | HostResumeRecoveryState::WaitingForDevice
-                    | HostResumeRecoveryState::RebuildingMappings
-                    | HostResumeRecoveryState::Failed
+                recovery.state,
+                TransportRecoveryState::Pending
+                    | TransportRecoveryState::WaitingForDevice
+                    | TransportRecoveryState::RebuildingMappings
+                    | TransportRecoveryState::Failed
             ) {
                 status.mappings_healthy = false;
             }
@@ -511,85 +527,91 @@ impl AdbHealthMonitor {
     }
 
     pub fn notify_host_resume(&self) -> u64 {
-        let generation = if let Ok(mut resume) = self.host_resume.lock() {
-            resume.generation = resume.generation.wrapping_add(1);
-            resume.attempt = 0;
-            resume.state = HostResumeRecoveryState::Pending;
-            resume.generation
+        self.usb_reconnect_pending.store(false, Ordering::Release);
+        self.notify_transport_recovery(TransportRecoveryTrigger::HostResume)
+    }
+
+    fn notify_transport_recovery(&self, trigger: TransportRecoveryTrigger) -> u64 {
+        let generation = if let Ok(mut recovery) = self.transport_recovery.lock() {
+            recovery.generation = recovery.generation.wrapping_add(1);
+            recovery.attempt = 0;
+            recovery.state = TransportRecoveryState::Pending;
+            recovery.trigger = Some(trigger);
+            recovery.generation
         } else {
             0
         };
-        self.sync_host_resume_status(Some("host_resume_recovery_pending".into()));
+        self.sync_transport_recovery_status(Some("transport_recovery_pending".into()));
         self.changed.notify_one();
         generation
     }
 
-    fn host_resume_requires_recovery(&self) -> bool {
+    fn transport_requires_recovery(&self) -> bool {
         matches!(
-            self.host_resume_snapshot().state,
-            HostResumeRecoveryState::Pending
-                | HostResumeRecoveryState::WaitingForDevice
-                | HostResumeRecoveryState::RebuildingMappings
-                | HostResumeRecoveryState::Failed
+            self.transport_recovery_snapshot().state,
+            TransportRecoveryState::Pending
+                | TransportRecoveryState::WaitingForDevice
+                | TransportRecoveryState::RebuildingMappings
+                | TransportRecoveryState::Failed
         )
     }
 
-    fn wait_for_resume_device(&self) {
-        if let Ok(mut resume) = self.host_resume.lock() {
-            resume.attempt = 0;
-            resume.state = HostResumeRecoveryState::WaitingForDevice;
+    fn wait_for_recovery_device(&self) {
+        if let Ok(mut recovery) = self.transport_recovery.lock() {
+            recovery.attempt = 0;
+            recovery.state = TransportRecoveryState::WaitingForDevice;
         }
-        self.sync_host_resume_status(Some("host_resume_waiting_for_device".into()));
+        self.sync_transport_recovery_status(Some("transport_recovery_waiting_for_device".into()));
     }
 
-    fn begin_host_resume_attempt(&self) -> Option<(u64, u32)> {
-        let attempt = if let Ok(mut resume) = self.host_resume.lock() {
+    fn begin_transport_recovery_attempt(&self) -> Option<(u64, u32, TransportRecoveryTrigger)> {
+        let attempt = if let Ok(mut recovery) = self.transport_recovery.lock() {
             if !matches!(
-                resume.state,
-                HostResumeRecoveryState::Pending | HostResumeRecoveryState::WaitingForDevice
-            ) || resume.attempt >= HOST_RESUME_MAX_ATTEMPTS
+                recovery.state,
+                TransportRecoveryState::Pending | TransportRecoveryState::WaitingForDevice
+            ) || recovery.attempt >= TRANSPORT_RECOVERY_MAX_ATTEMPTS
             {
                 return None;
             }
-            resume.attempt += 1;
-            resume.state = HostResumeRecoveryState::RebuildingMappings;
-            (resume.generation, resume.attempt)
+            recovery.attempt += 1;
+            recovery.state = TransportRecoveryState::RebuildingMappings;
+            (recovery.generation, recovery.attempt, recovery.trigger?)
         } else {
             return None;
         };
-        self.sync_host_resume_status(Some("host_resume_rebuilding_mappings".into()));
+        self.sync_transport_recovery_status(Some("transport_recovery_rebuilding".into()));
         Some(attempt)
     }
 
-    fn finish_host_resume_attempt(&self, generation: u64, succeeded: bool) -> bool {
+    fn finish_transport_recovery_attempt(&self, generation: u64, succeeded: bool) -> bool {
         let mut retry = false;
-        if let Ok(mut resume) = self.host_resume.lock() {
-            if resume.generation != generation {
+        if let Ok(mut recovery) = self.transport_recovery.lock() {
+            if recovery.generation != generation {
                 return false;
             }
             if succeeded {
-                resume.state = HostResumeRecoveryState::AwaitingControl;
-            } else if resume.attempt < HOST_RESUME_MAX_ATTEMPTS {
-                resume.state = HostResumeRecoveryState::Pending;
+                recovery.state = TransportRecoveryState::AwaitingControl;
+            } else if recovery.attempt < TRANSPORT_RECOVERY_MAX_ATTEMPTS {
+                recovery.state = TransportRecoveryState::Pending;
                 retry = true;
             } else {
-                resume.state = HostResumeRecoveryState::Failed;
+                recovery.state = TransportRecoveryState::Failed;
             }
         }
-        self.sync_host_resume_status((!succeeded).then(|| {
+        self.sync_transport_recovery_status((!succeeded).then(|| {
             if retry {
-                "host_resume_mapping_rebuild_retry".into()
+                "transport_recovery_retry".into()
             } else {
-                "host_resume_mapping_rebuild_failed".into()
+                "transport_recovery_failed".into()
             }
         }));
         retry
     }
 
-    fn finish_host_resume_control(&self) {
-        let recovered = if let Ok(mut resume) = self.host_resume.lock() {
-            if resume.state == HostResumeRecoveryState::AwaitingControl {
-                resume.state = HostResumeRecoveryState::Recovered;
+    fn finish_transport_recovery_control(&self) {
+        let recovered = if let Ok(mut recovery) = self.transport_recovery.lock() {
+            if recovery.state == TransportRecoveryState::AwaitingControl {
+                recovery.state = TransportRecoveryState::Recovered;
                 true
             } else {
                 false
@@ -598,8 +620,24 @@ impl AdbHealthMonitor {
             false
         };
         if recovered {
-            self.sync_host_resume_status(None);
+            self.sync_transport_recovery_status(None);
         }
+    }
+
+    fn note_usb_disconnected(&self) {
+        if self.transport_recovery_snapshot().trigger != Some(TransportRecoveryTrigger::HostResume)
+            || !self.transport_requires_recovery()
+        {
+            self.usb_reconnect_pending.store(true, Ordering::Release);
+        }
+    }
+
+    fn notify_usb_reconnected_if_needed(&self) -> bool {
+        if !self.usb_reconnect_pending.swap(false, Ordering::AcqRel) {
+            return false;
+        }
+        self.notify_transport_recovery(TransportRecoveryTrigger::UsbReconnect);
+        true
     }
 
     fn record_mapping_probe(&self, duration: Duration) {
@@ -640,15 +678,14 @@ impl AdbHealthMonitor {
     }
 
     pub fn notify_authenticated_connection(&self) {
-        self.finish_host_resume_control();
+        self.finish_transport_recovery_control();
         self.authenticated_reconcile.store(true, Ordering::Release);
         self.changed.notify_one();
     }
 
     async fn run(
         self,
-        adb: AdbController,
-        adb_program: PathBuf,
+        config: AdbMonitorConfig,
         control: ControlHandle,
         store: StateStore,
         diagnostics: Diagnostics,
@@ -659,13 +696,17 @@ impl AdbHealthMonitor {
         const INITIAL_BACKOFF: Duration = Duration::from_millis(250);
         const MAX_BACKOFF: Duration = Duration::from_secs(5);
 
-        let adb = adb.with_mapping_timeout(MONITOR_ADB_TIMEOUT);
+        let config = AdbMonitorConfig {
+            adb: config.adb.with_mapping_timeout(MONITOR_ADB_TIMEOUT),
+            ..config
+        };
+        let adb = &config.adb;
         let mut backoff = INITIAL_BACKOFF;
         loop {
             if self.stopping.load(Ordering::Acquire) {
                 return;
             }
-            let mut child = match spawn_track_devices(&adb_program) {
+            let mut child = match spawn_track_devices(&config.adb_program) {
                 Ok(child) => child,
                 Err(_) => {
                     self.track_failed(&control, &store, &diagnostics, "track_spawn_failed")
@@ -714,11 +755,14 @@ impl AdbHealthMonitor {
                                 };
                                 for available in updates {
                                     device_available = Some(available);
+                                    if available {
+                                        self.notify_usb_reconnected_if_needed();
+                                    }
                                     let forced = self
                                         .authenticated_reconcile
                                         .swap(false, Ordering::AcqRel);
-                                    if !self.recover_host_resume(
-                                        &adb,
+                                    if !self.recover_transport(
+                                        &config,
                                         &control,
                                         &store,
                                         &diagnostics,
@@ -726,7 +770,7 @@ impl AdbHealthMonitor {
                                         available,
                                     ).await {
                                         self.reconcile(
-                                            &adb,
+                                            adb,
                                             &control,
                                             &store,
                                             &diagnostics,
@@ -759,9 +803,9 @@ impl AdbHealthMonitor {
                         let forced = self
                             .authenticated_reconcile
                             .swap(false, Ordering::AcqRel);
-                        if self.host_resume_requires_recovery() {
-                            self.recover_host_resume(
-                                &adb,
+                        if self.transport_requires_recovery() {
+                            self.recover_transport(
+                                &config,
                                 &control,
                                 &store,
                                 &diagnostics,
@@ -774,7 +818,7 @@ impl AdbHealthMonitor {
                             self.snapshot().mappings_healthy,
                         ) {
                             self.reconcile(
-                                &adb,
+                                adb,
                                 &control,
                                 &store,
                                 &diagnostics,
@@ -793,9 +837,9 @@ impl AdbHealthMonitor {
                         let forced = self
                             .authenticated_reconcile
                             .swap(false, Ordering::AcqRel);
-                        if self.host_resume_requires_recovery() {
-                            self.recover_host_resume(
-                                &adb,
+                        if self.transport_requires_recovery() {
+                            self.recover_transport(
+                                &config,
                                 &control,
                                 &store,
                                 &diagnostics,
@@ -804,7 +848,7 @@ impl AdbHealthMonitor {
                             ).await;
                         } else if forced || cached_device_is_available(device_available) {
                             self.reconcile(
-                                &adb,
+                                adb,
                                 &control,
                                 &store,
                                 &diagnostics,
@@ -849,16 +893,16 @@ impl AdbHealthMonitor {
         });
     }
 
-    async fn recover_host_resume(
+    async fn recover_transport(
         &self,
-        adb: &AdbController,
+        config: &AdbMonitorConfig,
         control: &ControlHandle,
         store: &StateStore,
         diagnostics: &Diagnostics,
         relay_gate: &RelayGateController,
         device_available: bool,
     ) -> bool {
-        if !self.host_resume_requires_recovery() {
+        if !self.transport_requires_recovery() {
             return false;
         }
         relay_gate.carrier_lost();
@@ -866,29 +910,31 @@ impl AdbHealthMonitor {
             return true;
         }
         if !device_available {
-            self.wait_for_resume_device();
+            self.wait_for_recovery_device();
             self.update_status(
                 true,
                 false,
                 false,
-                Some("host_resume_waiting_for_device".into()),
+                Some("transport_recovery_waiting_for_device".into()),
             );
             return true;
         }
-        let Some((resume_generation, attempt)) = self.begin_host_resume_attempt() else {
+        let Some((recovery_generation, attempt, trigger)) = self.begin_transport_recovery_attempt()
+        else {
             return true;
         };
         self.update_status(
             true,
             true,
             false,
-            Some("host_resume_rebuilding_mappings".into()),
+            Some("transport_recovery_rebuilding".into()),
         );
         let _ = diagnostics.record(
-            "host_resume_recovery_attempt",
+            "transport_recovery_attempt",
             json!({
-                "generation": resume_generation,
+                "generation": recovery_generation,
                 "attempt": attempt,
+                "trigger": trigger,
             }),
         );
 
@@ -896,61 +942,74 @@ impl AdbHealthMonitor {
         if self.stopping.load(Ordering::Acquire) {
             return true;
         }
-        let recovery_adb = adb.clone();
-        let result = task::spawn_blocking(move || recovery_adb.reinstall_mappings()).await;
-        if self.host_resume_snapshot().generation != resume_generation {
+        let recovery_adb = config.adb.clone();
+        let session_id = config.session_id;
+        let all_traffic = config.all_traffic;
+        let result = task::spawn_blocking(move || match trigger {
+            TransportRecoveryTrigger::HostResume => recovery_adb.reinstall_mappings(),
+            TransportRecoveryTrigger::UsbReconnect => {
+                recovery_adb.start(session_id, all_traffic).map(|_| ())
+            }
+        })
+        .await;
+        if self.transport_recovery_snapshot().generation != recovery_generation {
             return true;
         }
         match result {
             Ok(Ok(())) => {
                 // A control connection can race mapping recreation. Cancel it
                 // after the fresh listeners are installed so only a HELLO from
-                // this resume generation can reopen the relay.
+                // this recovery generation can reopen the relay.
                 relay_gate.control_inactive();
-                let snapshot = control.reset_transport(HOST_RESUME_RECOVERY_REASON).await;
+                let snapshot = control.reset_transport(TRANSPORT_RECOVERY_REASON).await;
                 let _ = store.write(&snapshot, Some(std::process::id()));
                 let reconnect_generation = self
                     .reconnect_generation
                     .fetch_add(1, Ordering::Relaxed)
                     .saturating_add(1);
-                self.finish_host_resume_attempt(resume_generation, true);
+                self.finish_transport_recovery_attempt(recovery_generation, true);
                 self.update_status(true, true, true, None);
                 relay_gate.carrier_healthy();
                 let _ = diagnostics.record(
-                    "host_resume_recovery_ready",
+                    "transport_recovery_ready",
                     json!({
-                        "generation": resume_generation,
+                        "generation": recovery_generation,
                         "attempt": attempt,
+                        "trigger": trigger,
                         "reconnect_generation": reconnect_generation,
                         "waiting_for": "authenticated_control",
                     }),
                 );
             }
             Ok(Err(_)) | Err(_) => {
-                let retry = self.finish_host_resume_attempt(resume_generation, false);
+                let retry = self.finish_transport_recovery_attempt(recovery_generation, false);
                 self.update_status(
                     true,
                     true,
                     false,
                     Some(if retry {
-                        "host_resume_mapping_rebuild_retry".into()
+                        "transport_recovery_retry".into()
                     } else {
-                        "host_resume_mapping_rebuild_failed".into()
+                        "transport_recovery_failed".into()
                     }),
                 );
                 let _ = diagnostics.record(
-                    "host_resume_recovery_failed",
+                    "transport_recovery_failed",
                     json!({
-                        "generation": resume_generation,
+                        "generation": recovery_generation,
                         "attempt": attempt,
+                        "trigger": trigger,
                         "will_retry": retry,
-                        "category": "mapping_rebuild",
+                        "category": match trigger {
+                            TransportRecoveryTrigger::HostResume => "mapping_rebuild",
+                            TransportRecoveryTrigger::UsbReconnect => "android_restart",
+                        },
                     }),
                 );
                 if retry {
                     let changed = self.changed.clone();
                     tokio::spawn(async move {
-                        time::sleep(HOST_RESUME_RETRY_DELAY).await;
+                        time::sleep(TRANSPORT_RECOVERY_RETRY_DELAY).await;
                         changed.notify_one();
                     });
                 }
@@ -975,6 +1034,9 @@ impl AdbHealthMonitor {
         let lifecycle_active =
             matches!(lifecycle.state, HostState::Connected | HostState::Degraded);
         if !device_available {
+            if lifecycle_active {
+                self.note_usb_disconnected();
+            }
             relay_gate.carrier_lost();
             if lifecycle_active {
                 self.record_loss(control, store, diagnostics, false, "device_unavailable")
@@ -1123,6 +1185,7 @@ impl AdbHealthMonitor {
             control.snapshot().await.state,
             HostState::Connected | HostState::Degraded
         ) {
+            self.note_usb_disconnected();
             self.record_loss(control, store, diagnostics, false, category)
                 .await;
         }
@@ -1150,7 +1213,7 @@ impl AdbHealthMonitor {
                 mapping_probe_count: self.mapping_probe_count.load(Ordering::Relaxed),
                 mapping_probe_last_us: self.mapping_probe_last_us.load(Ordering::Relaxed),
                 mapping_probe_max_us: self.mapping_probe_max_us.load(Ordering::Relaxed),
-                host_resume: self.host_resume_snapshot(),
+                transport_recovery: self.transport_recovery_snapshot(),
                 last_error,
             };
             let changed = *status != next;
@@ -1425,6 +1488,7 @@ pub struct RuntimeConfig {
     pub socks_bind: SocketAddr,
     pub udp_bind: SocketAddr,
     pub session_id: SessionId,
+    pub all_traffic: bool,
     pub paths: AppPaths,
     pub adb: AdbController,
     pub adb_program: PathBuf,
@@ -1433,6 +1497,7 @@ pub struct RuntimeConfig {
 impl RuntimeConfig {
     pub fn new(
         session_id: SessionId,
+        all_traffic: bool,
         paths: AppPaths,
         adb: AdbController,
         adb_program: PathBuf,
@@ -1442,6 +1507,7 @@ impl RuntimeConfig {
             socks_bind: SocketAddr::new(Ipv4Addr::LOCALHOST.into(), SOCKS_PORT),
             udp_bind: SocketAddr::new(Ipv4Addr::LOCALHOST.into(), UDP_STREAM_PORT),
             session_id,
+            all_traffic,
             paths,
             adb,
             adb_program,
@@ -1663,8 +1729,12 @@ impl HostRuntime {
         });
 
         let monitor = tokio::spawn(adb_monitor.clone().run(
-            self.config.adb.clone(),
-            self.config.adb_program.clone(),
+            AdbMonitorConfig {
+                adb: self.config.adb.clone(),
+                adb_program: self.config.adb_program.clone(),
+                session_id: self.config.session_id,
+                all_traffic: self.config.all_traffic,
+            },
             control_handle.clone(),
             store.clone(),
             diagnostics.clone(),
@@ -1742,7 +1812,7 @@ fn flatten_runtime_task(
 fn update_relay_gate(relay_gate: &RelayGateController, snapshot: &StateSnapshot) {
     match snapshot.state {
         HostState::Connected => relay_gate.control_connected(),
-        HostState::Degraded if snapshot.reason.as_deref() == Some(HOST_RESUME_RECOVERY_REASON) => {
+        HostState::Degraded if snapshot.reason.as_deref() == Some(TRANSPORT_RECOVERY_REASON) => {
             relay_gate.carrier_lost();
         }
         HostState::Degraded
@@ -1923,7 +1993,7 @@ impl AdminServer {
                 let status = if matches!(status.state, HostState::Connected | HostState::Degraded) {
                     self.adb_monitor.notify_host_resume();
                     self.control
-                        .reset_transport(HOST_RESUME_RECOVERY_REASON)
+                        .reset_transport(TRANSPORT_RECOVERY_REASON)
                         .await
                 } else {
                     status
@@ -2785,18 +2855,32 @@ pub fn terminate_daemon(identity_path: &Path, timeout: Duration) -> io::Result<(
 
 #[cfg(test)]
 mod tests {
-    use crate::adb::{AdbError, AdbExecutor, AdbOutput, REVERSE_MAPPINGS};
+    use crate::adb::{
+        AdbError, AdbExecutor, AdbOutput, ACTION_START_V4, ACTION_STOP_V4, REVERSE_MAPPINGS,
+    };
     #[cfg(unix)]
     use crate::protocol::{Frame, MessageType};
 
     use super::*;
 
-    #[derive(Default)]
     struct MonitorMockAdb {
         calls: StdMutex<Vec<Vec<String>>>,
         mapping_adds: AtomicU64,
         mapping_delay_ms: AtomicU64,
         screen_suspended: AtomicBool,
+        vpn_active: AtomicBool,
+    }
+
+    impl Default for MonitorMockAdb {
+        fn default() -> Self {
+            Self {
+                calls: StdMutex::new(Vec::new()),
+                mapping_adds: AtomicU64::new(0),
+                mapping_delay_ms: AtomicU64::new(0),
+                screen_suspended: AtomicBool::new(false),
+                vpn_active: AtomicBool::new(true),
+            }
+        }
     }
 
     impl AdbExecutor for MonitorMockAdb {
@@ -2805,7 +2889,18 @@ mod tests {
             if args.iter().any(|argument| argument == "get-state") {
                 return Ok(AdbOutput::success("device\n"));
             }
+            if args.iter().any(|argument| argument == ACTION_STOP_V4) {
+                self.vpn_active.store(false, Ordering::Relaxed);
+                return Ok(AdbOutput::success("Stopping"));
+            }
+            if args.iter().any(|argument| argument == ACTION_START_V4) {
+                self.vpn_active.store(true, Ordering::Relaxed);
+                return Ok(AdbOutput::success("Starting"));
+            }
             if args.iter().any(|argument| argument == "activity") {
+                if !self.vpn_active.load(Ordering::Relaxed) {
+                    return Ok(AdbOutput::success("No services match"));
+                }
                 return Ok(AdbOutput::success(format!(
                     "gnirehtet.state={}\nscreenSuspended={}\n",
                     if self.screen_suspended.load(Ordering::Relaxed) {
@@ -3319,14 +3414,20 @@ mod tests {
         let monitor = AdbHealthMonitor::default();
         let generation = monitor.notify_host_resume();
         assert_eq!(generation, 1);
-        assert_eq!(monitor.begin_host_resume_attempt(), Some((1, 1)));
-        assert!(monitor.finish_host_resume_attempt(1, false));
-        assert_eq!(monitor.begin_host_resume_attempt(), Some((1, 2)));
-        assert!(!monitor.finish_host_resume_attempt(1, false));
-        assert_eq!(monitor.begin_host_resume_attempt(), None);
         assert_eq!(
-            monitor.snapshot().host_resume.state,
-            HostResumeRecoveryState::Failed
+            monitor.begin_transport_recovery_attempt(),
+            Some((1, 1, TransportRecoveryTrigger::HostResume))
+        );
+        assert!(monitor.finish_transport_recovery_attempt(1, false));
+        assert_eq!(
+            monitor.begin_transport_recovery_attempt(),
+            Some((1, 2, TransportRecoveryTrigger::HostResume))
+        );
+        assert!(!monitor.finish_transport_recovery_attempt(1, false));
+        assert_eq!(monitor.begin_transport_recovery_attempt(), None);
+        assert_eq!(
+            monitor.snapshot().transport_recovery.state,
+            TransportRecoveryState::Failed
         );
     }
 
@@ -3352,7 +3453,12 @@ mod tests {
         executor
             .mapping_adds
             .store(REVERSE_MAPPINGS.len() as u64, Ordering::Relaxed);
-        let adb = AdbController::new(executor.clone());
+        let config = AdbMonitorConfig {
+            adb: AdbController::new(executor.clone()),
+            adb_program: PathBuf::new(),
+            session_id: session,
+            all_traffic: true,
+        };
         let monitor = AdbHealthMonitor::default();
         let relay_gate = RelayGate::default();
         let relay_controller = RelayGateController::new(relay_gate.clone());
@@ -3362,8 +3468,8 @@ mod tests {
         monitor.notify_host_resume();
         assert!(
             monitor
-                .recover_host_resume(
-                    &adb,
+                .recover_transport(
+                    &config,
                     &control.command_handle(),
                     &store,
                     &diagnostics,
@@ -3377,8 +3483,8 @@ mod tests {
         assert_eq!(snapshot.reconnect_generation, 1);
         assert!(snapshot.mappings_healthy);
         assert_eq!(
-            snapshot.host_resume.state,
-            HostResumeRecoveryState::AwaitingControl
+            snapshot.transport_recovery.state,
+            TransportRecoveryState::AwaitingControl
         );
         assert!(!relay_gate.is_enabled());
         let calls = executor.calls.lock().unwrap();
@@ -3394,8 +3500,96 @@ mod tests {
         monitor.notify_authenticated_connection();
         relay_controller.control_connected();
         assert_eq!(
-            monitor.snapshot().host_resume.state,
-            HostResumeRecoveryState::Recovered
+            monitor.snapshot().transport_recovery.state,
+            TransportRecoveryState::Recovered
+        );
+        assert!(relay_gate.is_enabled());
+    }
+
+    #[tokio::test]
+    async fn usb_reconnect_restarts_android_session_before_waiting_for_fresh_control() {
+        let directory = tempfile::tempdir().unwrap();
+        let paths = AppPaths::discover(Some(directory.path().to_owned())).unwrap();
+        let diagnostics = Diagnostics::open(&paths.logs).unwrap();
+        let store = StateStore::new(&paths.status);
+        let session = SessionId([0x76; 16]);
+        let control = ControlServer::new(ControlConfig {
+            bind: "127.0.0.1:0".parse().unwrap(),
+            session_id: session,
+        })
+        .unwrap();
+        control
+            .state()
+            .lock()
+            .await
+            .peer_started(session, std::time::Instant::now())
+            .unwrap();
+        let executor = Arc::new(MonitorMockAdb::default());
+        executor
+            .mapping_adds
+            .store(REVERSE_MAPPINGS.len() as u64, Ordering::Relaxed);
+        let config = AdbMonitorConfig {
+            adb: AdbController::new(executor.clone()),
+            adb_program: PathBuf::new(),
+            session_id: session,
+            all_traffic: false,
+        };
+        let monitor = AdbHealthMonitor::default();
+        let relay_gate = RelayGate::default();
+        let relay_controller = RelayGateController::new(relay_gate.clone());
+        relay_controller.control_connected();
+
+        monitor.note_usb_disconnected();
+        assert!(monitor.notify_usb_reconnected_if_needed());
+        assert!(
+            monitor
+                .recover_transport(
+                    &config,
+                    &control.command_handle(),
+                    &store,
+                    &diagnostics,
+                    &relay_controller,
+                    true,
+                )
+                .await
+        );
+
+        let snapshot = monitor.snapshot();
+        assert_eq!(
+            snapshot.transport_recovery.trigger,
+            Some(TransportRecoveryTrigger::UsbReconnect)
+        );
+        assert_eq!(
+            snapshot.transport_recovery.state,
+            TransportRecoveryState::AwaitingControl
+        );
+        assert!(!relay_gate.is_enabled());
+        let calls = executor.calls.lock().unwrap();
+        let stop = calls
+            .iter()
+            .position(|args| args.iter().any(|argument| argument == ACTION_STOP_V4))
+            .unwrap();
+        let start = calls
+            .iter()
+            .position(|args| args.iter().any(|argument| argument == ACTION_START_V4))
+            .unwrap();
+        assert!(stop < start);
+        let start_args = &calls[start];
+        let all_traffic = start_args
+            .iter()
+            .position(|argument| argument == "allTraffic")
+            .unwrap();
+        assert_eq!(
+            start_args.get(all_traffic + 1).map(String::as_str),
+            Some("false")
+        );
+        drop(calls);
+
+        monitor.notify_authenticated_connection();
+        relay_controller.control_connected();
+        assert_eq!(
+            monitor.snapshot().transport_recovery.state,
+            TransportRecoveryState::Recovered
         );
         assert!(relay_gate.is_enabled());
     }
