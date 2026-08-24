@@ -1,9 +1,12 @@
 use std::{
+    io::Error as StdIoError,
     net::{Ipv4Addr, SocketAddr},
+    pin::Pin,
     sync::{
         atomic::{AtomicU64, AtomicUsize, Ordering},
-        Arc,
+        Arc, Mutex as StdMutex,
     },
+    task::{Context, Poll},
     time::Duration,
 };
 
@@ -12,7 +15,7 @@ use serde_json::json;
 use thiserror::Error;
 use tokio::{
     io::{self, AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt},
-    net::{TcpListener, TcpStream},
+    net::{TcpListener, TcpSocket, TcpStream, UdpSocket as TokioUdpSocket},
     sync::{watch, Semaphore},
     time,
 };
@@ -30,6 +33,193 @@ pub const AUTH_NONE: u8 = 0x00;
 pub const AUTH_UNACCEPTABLE: u8 = 0xff;
 pub const CMD_CONNECT: u8 = 0x01;
 pub const CMD_FWD_UDP: u8 = 0x05;
+const VIRTUAL_DESKTOP_STREAMER_PORTS: [u16; 4] = [38_810, 38_820, 38_830, 38_840];
+
+#[derive(Clone, Default)]
+pub struct VirtualDesktopFlowMonitor {
+    active: Arc<[AtomicUsize; VIRTUAL_DESKTOP_STREAMER_PORTS.len()]>,
+}
+
+impl VirtualDesktopFlowMonitor {
+    fn begin(&self, destination_port: u16) -> Option<VirtualDesktopFlowGuard> {
+        let index = VIRTUAL_DESKTOP_STREAMER_PORTS
+            .iter()
+            .position(|port| *port == destination_port)?;
+        self.active[index].fetch_add(1, Ordering::Relaxed);
+        Some(VirtualDesktopFlowGuard {
+            monitor: self.clone(),
+            index,
+        })
+    }
+
+    pub fn snapshot(&self) -> VirtualDesktopFlowSnapshot {
+        let active_flows = std::array::from_fn(|index| self.active[index].load(Ordering::Relaxed));
+        VirtualDesktopFlowSnapshot {
+            connected: active_flows.iter().all(|count| *count > 0),
+            active_ports: active_flows.iter().filter(|count| **count > 0).count(),
+            active_flows,
+        }
+    }
+}
+
+struct VirtualDesktopFlowGuard {
+    monitor: VirtualDesktopFlowMonitor,
+    index: usize,
+}
+
+impl Drop for VirtualDesktopFlowGuard {
+    fn drop(&mut self) {
+        self.monitor.active[self.index].fetch_sub(1, Ordering::Relaxed);
+    }
+}
+
+#[derive(Clone, Debug, Default, Deserialize, Eq, PartialEq, Serialize)]
+pub struct VirtualDesktopFlowSnapshot {
+    pub connected: bool,
+    pub active_ports: usize,
+    pub active_flows: [usize; VIRTUAL_DESKTOP_STREAMER_PORTS.len()],
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum FlowEndpoint {
+    Quest,
+    Streamer,
+}
+
+impl FlowEndpoint {
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::Quest => "quest",
+            Self::Streamer => "streamer",
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum FlowTerminalEvent {
+    ReadEof,
+    ReadError,
+    WriteError,
+}
+
+impl FlowTerminalEvent {
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::ReadEof => "read_eof",
+            Self::ReadError => "read_error",
+            Self::WriteError => "write_error",
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct FlowTerminal {
+    endpoint: FlowEndpoint,
+    event: FlowTerminalEvent,
+}
+
+#[derive(Default)]
+struct FlowObservation {
+    first_terminal: StdMutex<Option<FlowTerminal>>,
+}
+
+impl FlowObservation {
+    fn record(&self, endpoint: FlowEndpoint, event: FlowTerminalEvent) {
+        let Ok(mut first_terminal) = self.first_terminal.lock() else {
+            return;
+        };
+        if first_terminal.is_none() {
+            *first_terminal = Some(FlowTerminal { endpoint, event });
+        }
+    }
+
+    fn first_terminal(&self) -> Option<FlowTerminal> {
+        self.first_terminal.lock().ok().and_then(|value| *value)
+    }
+}
+
+struct ObservedIo<'a, T> {
+    inner: T,
+    endpoint: FlowEndpoint,
+    observation: &'a FlowObservation,
+}
+
+impl<'a, T> ObservedIo<'a, T> {
+    fn new(inner: T, endpoint: FlowEndpoint, observation: &'a FlowObservation) -> Self {
+        Self {
+            inner,
+            endpoint,
+            observation,
+        }
+    }
+
+    fn record_error(&self, event: FlowTerminalEvent, result: &Poll<Result<(), StdIoError>>) {
+        if matches!(result, Poll::Ready(Err(_))) {
+            self.observation.record(self.endpoint, event);
+        }
+    }
+}
+
+impl<T> AsyncRead for ObservedIo<'_, T>
+where
+    T: AsyncRead + Unpin,
+{
+    fn poll_read(
+        self: Pin<&mut Self>,
+        context: &mut Context<'_>,
+        buffer: &mut io::ReadBuf<'_>,
+    ) -> Poll<Result<(), StdIoError>> {
+        let this = self.get_mut();
+        let filled_before = buffer.filled().len();
+        let result = Pin::new(&mut this.inner).poll_read(context, buffer);
+        match &result {
+            Poll::Ready(Ok(())) if buffer.filled().len() == filled_before => this
+                .observation
+                .record(this.endpoint, FlowTerminalEvent::ReadEof),
+            Poll::Ready(Err(_)) => this
+                .observation
+                .record(this.endpoint, FlowTerminalEvent::ReadError),
+            _ => {}
+        }
+        result
+    }
+}
+
+impl<T> AsyncWrite for ObservedIo<'_, T>
+where
+    T: AsyncWrite + Unpin,
+{
+    fn poll_write(
+        self: Pin<&mut Self>,
+        context: &mut Context<'_>,
+        buffer: &[u8],
+    ) -> Poll<Result<usize, StdIoError>> {
+        let this = self.get_mut();
+        let result = Pin::new(&mut this.inner).poll_write(context, buffer);
+        if matches!(result, Poll::Ready(Err(_))) {
+            this.observation
+                .record(this.endpoint, FlowTerminalEvent::WriteError);
+        }
+        result
+    }
+
+    fn poll_flush(self: Pin<&mut Self>, context: &mut Context<'_>) -> Poll<Result<(), StdIoError>> {
+        let this = self.get_mut();
+        let result = Pin::new(&mut this.inner).poll_flush(context);
+        this.record_error(FlowTerminalEvent::WriteError, &result);
+        result
+    }
+
+    fn poll_shutdown(
+        self: Pin<&mut Self>,
+        context: &mut Context<'_>,
+    ) -> Poll<Result<(), StdIoError>> {
+        let this = self.get_mut();
+        let result = Pin::new(&mut this.inner).poll_shutdown(context);
+        this.record_error(FlowTerminalEvent::WriteError, &result);
+        result
+    }
+}
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum SocksCommand {
@@ -114,6 +304,7 @@ pub struct SocksServer {
     config: SocksConfig,
     stats: SocksStats,
     udp_stats: UdpStats,
+    virtual_desktop_flows: VirtualDesktopFlowMonitor,
     diagnostics: Option<Diagnostics>,
     relay_gate: Option<RelayGate>,
 }
@@ -194,6 +385,7 @@ impl SocksServer {
             config,
             stats: SocksStats::default(),
             udp_stats: UdpStats::default(),
+            virtual_desktop_flows: VirtualDesktopFlowMonitor::default(),
             diagnostics: None,
             relay_gate: None,
         })
@@ -212,7 +404,12 @@ impl SocksServer {
     pub fn stats(&self) -> SocksStatsSnapshot {
         let mut snapshot = self.stats.snapshot();
         snapshot.udp = self.udp_stats.snapshot();
+        snapshot.virtual_desktop = self.virtual_desktop_flows.snapshot();
         snapshot
+    }
+
+    pub fn virtual_desktop_flows(&self) -> VirtualDesktopFlowMonitor {
+        self.virtual_desktop_flows.clone()
     }
 
     pub async fn serve(self) -> Result<(), SocksError> {
@@ -338,14 +535,26 @@ impl SocksServer {
         mut client: TcpStream,
         destination: Endpoint,
     ) -> Result<(), SocksError> {
+        let destination_port = endpoint_port(&destination);
+        let vd_streamer_flow = VIRTUAL_DESKTOP_STREAMER_PORTS.contains(&destination_port);
+        let flow_started = time::Instant::now();
         let upstream = time::timeout(self.config.connect_timeout, async {
             let target = destination.resolve().await?;
-            TcpStream::connect(target)
+            let canonical_local_target = VIRTUAL_DESKTOP_STREAMER_PORTS.contains(&destination_port)
+                && socket_address_is_local(target);
+            let connect_target = if canonical_local_target {
+                primary_routed_ipv4_target(target.port()).await?
+            } else {
+                target
+            };
+            let redirected_local_target = connect_target.ip() != target.ip();
+            let upstream = TcpStream::connect(connect_target)
                 .await
-                .map_err(crate::udp::UdpRelayError::from)
+                .map_err(crate::udp::UdpRelayError::from)?;
+            Ok::<_, crate::udp::UdpRelayError>((upstream, redirected_local_target))
         })
         .await;
-        let mut upstream = match upstream {
+        let (upstream, redirected_local_target) = match upstream {
             Ok(Ok(stream)) => stream,
             Ok(Err(error)) => {
                 let _ = write_reply(
@@ -366,12 +575,64 @@ impl SocksServer {
                 return Err(SocksError::ConnectTimeout);
             }
         };
+        if redirected_local_target {
+            if let Some(diagnostics) = &self.diagnostics {
+                let _ = diagnostics.record(
+                    "vd_streamer_local_target_canonicalized",
+                    json!({"destination_port": destination_port}),
+                );
+            }
+        }
         client.set_nodelay(true)?;
         upstream.set_nodelay(true)?;
         let bound = upstream.local_addr()?;
         write_reply(&mut client, 0, Endpoint::Socket(bound)).await?;
-        let (from_client, from_upstream) =
-            io::copy_bidirectional(&mut client, &mut upstream).await?;
+        let _virtual_desktop_flow = self.virtual_desktop_flows.begin(destination_port);
+        if vd_streamer_flow {
+            if let Some(diagnostics) = &self.diagnostics {
+                let _ = diagnostics.record(
+                    "vd_streamer_flow_opened",
+                    json!({"destination_port": destination_port}),
+                );
+            }
+        }
+        let flow_observation = FlowObservation::default();
+        let mut client = ObservedIo::new(client, FlowEndpoint::Quest, &flow_observation);
+        let mut upstream = ObservedIo::new(upstream, FlowEndpoint::Streamer, &flow_observation);
+        let transfer = io::copy_bidirectional(&mut client, &mut upstream).await;
+        if vd_streamer_flow {
+            if let Some(diagnostics) = &self.diagnostics {
+                let duration_ms = flow_started.elapsed().as_millis().min(u64::MAX as u128) as u64;
+                let first_terminal = flow_observation.first_terminal();
+                let first_terminal_side = first_terminal
+                    .map(|terminal| terminal.endpoint.as_str())
+                    .unwrap_or("unknown");
+                let first_terminal_event = first_terminal
+                    .map(|terminal| terminal.event.as_str())
+                    .unwrap_or("unknown");
+                let fields = match &transfer {
+                    Ok((from_client, from_upstream)) => json!({
+                        "destination_port": destination_port,
+                        "duration_ms": duration_ms,
+                        "first_terminal_event": first_terminal_event,
+                        "first_terminal_side": first_terminal_side,
+                        "outcome": "eof",
+                        "tx_bytes": from_client,
+                        "rx_bytes": from_upstream,
+                    }),
+                    Err(error) => json!({
+                        "destination_port": destination_port,
+                        "duration_ms": duration_ms,
+                        "error_category": format!("{:?}", error.kind()),
+                        "first_terminal_event": first_terminal_event,
+                        "first_terminal_side": first_terminal_side,
+                        "outcome": "io_error",
+                    }),
+                };
+                let _ = diagnostics.record("vd_streamer_flow_ended", fields);
+            }
+        }
+        let (from_client, from_upstream) = transfer?;
         self.stats
             .tcp_tx_bytes
             .fetch_add(from_client, Ordering::Relaxed);
@@ -379,6 +640,42 @@ impl SocksServer {
             .tcp_rx_bytes
             .fetch_add(from_upstream, Ordering::Relaxed);
         Ok(())
+    }
+}
+
+fn endpoint_port(endpoint: &Endpoint) -> u16 {
+    match endpoint {
+        Endpoint::Socket(address) => address.port(),
+        Endpoint::Domain(_, port) => *port,
+    }
+}
+
+fn socket_address_is_local(mut target: SocketAddr) -> bool {
+    target.set_port(0);
+    let socket = match target {
+        SocketAddr::V4(_) => TcpSocket::new_v4(),
+        SocketAddr::V6(_) => TcpSocket::new_v6(),
+    };
+    socket.and_then(|socket| socket.bind(target)).is_ok()
+}
+
+async fn primary_routed_ipv4_target(
+    destination_port: u16,
+) -> Result<SocketAddr, crate::udp::UdpRelayError> {
+    let probe = TokioUdpSocket::bind(SocketAddr::new(Ipv4Addr::UNSPECIFIED.into(), 0)).await?;
+    probe
+        .connect(SocketAddr::new(Ipv4Addr::new(192, 0, 2, 1).into(), 9))
+        .await?;
+    let local = probe.local_addr()?;
+    match local.ip() {
+        std::net::IpAddr::V4(address) if !address.is_unspecified() && !address.is_loopback() => {
+            Ok(SocketAddr::new(address.into(), destination_port))
+        }
+        _ => Err(std::io::Error::new(
+            std::io::ErrorKind::AddrNotAvailable,
+            "primary routed IPv4 address is unavailable",
+        )
+        .into()),
     }
 }
 
@@ -476,6 +773,7 @@ impl SocksStats {
             tcp_tx_bytes: self.tcp_tx_bytes.load(Ordering::Relaxed),
             tcp_rx_bytes: self.tcp_rx_bytes.load(Ordering::Relaxed),
             udp: Default::default(),
+            virtual_desktop: Default::default(),
         }
     }
 }
@@ -488,6 +786,8 @@ pub struct SocksStatsSnapshot {
     pub tcp_tx_bytes: u64,
     pub tcp_rx_bytes: u64,
     pub udp: crate::udp::UdpStatsSnapshot,
+    #[serde(default)]
+    pub virtual_desktop: VirtualDesktopFlowSnapshot,
 }
 
 #[derive(Debug, Error)]
@@ -568,6 +868,51 @@ mod tests {
         assert_eq!(
             request.destination,
             Endpoint::Socket("127.0.0.1:4660".parse().unwrap())
+        );
+    }
+
+    #[test]
+    fn virtual_desktop_health_requires_all_four_live_ports() {
+        let monitor = VirtualDesktopFlowMonitor::default();
+        let mut guards = Vec::new();
+        for port in VIRTUAL_DESKTOP_STREAMER_PORTS {
+            guards.push(monitor.begin(port).unwrap());
+        }
+        assert_eq!(
+            monitor.snapshot(),
+            VirtualDesktopFlowSnapshot {
+                connected: true,
+                active_ports: 4,
+                active_flows: [1, 1, 1, 1],
+            }
+        );
+
+        guards.pop();
+        assert_eq!(monitor.snapshot().active_ports, 3);
+        assert!(!monitor.snapshot().connected);
+    }
+
+    #[test]
+    fn local_address_detection_requires_a_bindable_address() {
+        assert!(socket_address_is_local("127.0.0.1:38810".parse().unwrap()));
+        assert!(!socket_address_is_local("192.0.2.1:38810".parse().unwrap()));
+    }
+
+    #[tokio::test]
+    async fn flow_observation_records_the_endpoint_that_closes_first() {
+        let (quest_peer, quest_relay) = io::duplex(64);
+        let observation = FlowObservation::default();
+        let mut observed = ObservedIo::new(quest_relay, FlowEndpoint::Quest, &observation);
+
+        drop(quest_peer);
+        let mut byte = [0; 1];
+        assert_eq!(observed.read(&mut byte).await.unwrap(), 0);
+        assert_eq!(
+            observation.first_terminal(),
+            Some(FlowTerminal {
+                endpoint: FlowEndpoint::Quest,
+                event: FlowTerminalEvent::ReadEof,
+            })
         );
     }
 

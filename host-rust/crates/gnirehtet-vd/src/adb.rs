@@ -14,6 +14,8 @@ use std::{
 
 #[cfg(target_os = "windows")]
 use std::fs;
+#[cfg(target_os = "windows")]
+use std::sync::{Mutex, OnceLock};
 
 use crate::protocol::SessionId;
 use serde::{Deserialize, Serialize};
@@ -26,6 +28,8 @@ pub const ANDROID_VPN_SERVICE: &str = "com.genymobile.gnirehtet/.v4.VdLinkVpnSer
 pub const ACTION_START_V4: &str = "com.genymobile.gnirehtet.v4.START";
 pub const ACTION_STOP_V4: &str = "com.genymobile.gnirehtet.v4.STOP";
 pub const VIRTUAL_DESKTOP_PACKAGE: &str = "VirtualDesktop.Android";
+const VIRTUAL_DESKTOP_LAUNCHER_CATEGORY: &str = "android.intent.category.LAUNCHER";
+const VIRTUAL_DESKTOP_RESTART_SETTLE: Duration = Duration::from_millis(750);
 pub const ANDROID_VERSION_CODE: &str = "56";
 pub const ANDROID_VERSION_NAME: &str = "4.1.4";
 pub const PLATFORM_TOOLS_VERSION: &str = "37.0.0";
@@ -36,7 +40,7 @@ pub const PLATFORM_TOOLS_WINDOWS_SHA256: &str =
 pub const SOCKS_PORT: u16 = 31_416;
 pub const CONTROL_PORT: u16 = 31_417;
 pub const UDP_STREAM_PORT: u16 = 31_418;
-pub const ADB_DEVICE_COMMAND_TIMEOUT: Duration = Duration::from_secs(15);
+pub const ADB_DEVICE_COMMAND_TIMEOUT: Duration = Duration::from_secs(8);
 pub const ADB_MAPPING_COMMAND_TIMEOUT: Duration = Duration::from_secs(3);
 const ADB_INSTALL_TIMEOUT: Duration = Duration::from_secs(90);
 const MAX_ADB_OUTPUT_BYTES: usize = 1024 * 1024;
@@ -96,6 +100,10 @@ impl AdbOutput {
 
 pub trait AdbExecutor: Send + Sync {
     fn execute(&self, args: &[String], timeout: Duration) -> Result<AdbOutput, AdbError>;
+
+    fn recover_server(&self, _timeout: Duration) -> Result<(), AdbError> {
+        Ok(())
+    }
 }
 
 #[derive(Clone, Debug)]
@@ -113,6 +121,21 @@ impl SystemAdb {
     pub fn program(&self) -> &Path {
         &self.program
     }
+
+    fn execute_once(&self, args: &[String], timeout: Duration) -> Result<AdbOutput, AdbError> {
+        let mut command = Command::new(&self.program);
+        command
+            .args(args)
+            .stdin(Stdio::null())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped());
+        hide_subprocess_window(&mut command);
+        let child = command.spawn().map_err(|source| AdbError::Spawn {
+            program: self.program.clone(),
+            source,
+        })?;
+        collect_child_output(child, timeout)
+    }
 }
 
 fn hide_subprocess_window(command: &mut Command) {
@@ -128,18 +151,31 @@ fn hide_subprocess_window(command: &mut Command) {
 
 impl AdbExecutor for SystemAdb {
     fn execute(&self, args: &[String], timeout: Duration) -> Result<AdbOutput, AdbError> {
-        let mut command = Command::new(&self.program);
-        command
-            .args(args)
-            .stdin(Stdio::null())
-            .stdout(Stdio::piped())
-            .stderr(Stdio::piped());
-        hide_subprocess_window(&mut command);
-        let child = command.spawn().map_err(|source| AdbError::Spawn {
-            program: self.program.clone(),
-            source,
-        })?;
-        collect_child_output(child, timeout)
+        self.execute_once(args, timeout)
+    }
+
+    fn recover_server(&self, timeout: Duration) -> Result<(), AdbError> {
+        #[cfg(target_os = "windows")]
+        {
+            static RECOVERY_LOCK: OnceLock<Mutex<()>> = OnceLock::new();
+            let _recovery = RECOVERY_LOCK
+                .get_or_init(|| Mutex::new(()))
+                .lock()
+                .map_err(|_| AdbError::Read("ADB server recovery lock is poisoned".into()))?;
+            let mut command = Command::new("taskkill.exe");
+            command
+                .args(["/F", "/IM", "adb.exe"])
+                .stdin(Stdio::null())
+                .stdout(Stdio::piped())
+                .stderr(Stdio::piped());
+            hide_subprocess_window(&mut command);
+            if let Ok(child) = command.spawn() {
+                let _ = collect_child_output(child, Duration::from_secs(5));
+            }
+            thread::sleep(Duration::from_millis(250));
+        }
+        let _ = timeout;
+        Ok(())
     }
 }
 
@@ -735,7 +771,6 @@ impl AdbController {
             self.remove_all_mappings(&mut failures);
             return Err(TransactionError::new("android_start", failures));
         }
-
         Ok(StartReceipt {
             session_id,
             all_traffic,
@@ -895,6 +930,55 @@ impl AdbController {
             .to_owned())
     }
 
+    pub fn restart_virtual_desktop(&self) -> Result<(), AdbError> {
+        self.require_device()?;
+        let launcher = self.run_checked(&strings(&[
+            "-d",
+            "shell",
+            "cmd",
+            "package",
+            "resolve-activity",
+            "--brief",
+            "-c",
+            VIRTUAL_DESKTOP_LAUNCHER_CATEGORY,
+            VIRTUAL_DESKTOP_PACKAGE,
+        ]))?;
+        let component = parse_virtual_desktop_component(&launcher.stdout)
+            .ok_or(AdbError::VirtualDesktopActivityUnavailable)?;
+
+        self.run_checked(&strings(&[
+            "-d",
+            "shell",
+            "am",
+            "force-stop",
+            VIRTUAL_DESKTOP_PACKAGE,
+        ]))?;
+        thread::sleep(VIRTUAL_DESKTOP_RESTART_SETTLE);
+        self.run_checked(&[
+            "-d".into(),
+            "shell".into(),
+            "am".into(),
+            "start".into(),
+            "-W".into(),
+            "-n".into(),
+            component,
+        ])?;
+        Ok(())
+    }
+
+    pub fn stop_virtual_desktop(&self) -> Result<(), AdbError> {
+        self.require_device()?;
+        self.run_checked(&strings(&[
+            "-d",
+            "shell",
+            "am",
+            "force-stop",
+            VIRTUAL_DESKTOP_PACKAGE,
+        ]))?;
+        thread::sleep(VIRTUAL_DESKTOP_RESTART_SETTLE);
+        Ok(())
+    }
+
     pub fn android_status(&self) -> Result<AndroidVpnStatus, AdbError> {
         self.android_status_with_timeout(self.command_timeout)
     }
@@ -1016,6 +1100,7 @@ impl AdbController {
                     return Err(AdbError::DeviceNotReady(device_help(state)));
                 }
                 Err(AdbError::Timeout(_)) if attempt == 0 => {
+                    self.executor.recover_server(self.device_timeout)?;
                     thread::sleep(self.poll_interval);
                 }
                 Err(error) if adb_reports_missing_device(&error) => {
@@ -1152,6 +1237,8 @@ pub enum AdbError {
     CommandFailed { status: i32, stderr: String },
     #[error("{0}")]
     DeviceNotReady(String),
+    #[error("Virtual Desktop launcher activity is unavailable")]
+    VirtualDesktopActivityUnavailable,
     #[error("Android still reports an active VPN after the stop deadline")]
     VpnStillActive,
 }
@@ -1189,6 +1276,14 @@ impl TransactionError {
 
 fn strings(values: &[&str]) -> Vec<String> {
     values.iter().map(|value| (*value).to_owned()).collect()
+}
+
+fn parse_virtual_desktop_component(output: &str) -> Option<String> {
+    output.lines().rev().map(str::trim).find_map(|line| {
+        let activity = line.strip_prefix(VIRTUAL_DESKTOP_PACKAGE)?;
+        (activity.starts_with('/') && !line.chars().any(char::is_whitespace))
+            .then(|| line.to_owned())
+    })
 }
 
 fn package_version_matches(output: &str) -> bool {
@@ -1378,7 +1473,11 @@ pub enum AdbBootstrapError {
 
 #[cfg(test)]
 mod tests {
-    use std::{collections::VecDeque, io::Cursor, sync::Mutex};
+    use std::{
+        collections::VecDeque,
+        io::Cursor,
+        sync::{atomic::AtomicUsize, Mutex},
+    };
 
     use super::*;
 
@@ -1387,6 +1486,7 @@ mod tests {
         calls: Mutex<Vec<Vec<String>>>,
         timeouts: Mutex<Vec<(Vec<String>, Duration)>>,
         results: Mutex<VecDeque<Result<AdbOutput, AdbError>>>,
+        recoveries: AtomicUsize,
     }
 
     impl MockAdb {
@@ -1395,6 +1495,7 @@ mod tests {
                 calls: Mutex::new(Vec::new()),
                 timeouts: Mutex::new(Vec::new()),
                 results: Mutex::new(results.into()),
+                recoveries: AtomicUsize::new(0),
             }
         }
     }
@@ -1408,6 +1509,11 @@ mod tests {
                 .unwrap()
                 .pop_front()
                 .unwrap_or_else(|| Ok(AdbOutput::success("")))
+        }
+
+        fn recover_server(&self, _timeout: Duration) -> Result<(), AdbError> {
+            self.recoveries.fetch_add(1, Ordering::Relaxed);
+            Ok(())
         }
     }
 
@@ -1710,6 +1816,7 @@ mod tests {
         assert!(device_checks
             .iter()
             .all(|(_, timeout)| *timeout == ADB_DEVICE_COMMAND_TIMEOUT));
+        assert_eq!(mock.recoveries.load(Ordering::Relaxed), 1);
     }
 
     #[test]
@@ -1742,6 +1849,86 @@ mod tests {
         assert_eq!(error.phase, "device_check");
         assert!(error.failures[0].contains("accept the USB debugging prompt"));
         assert_eq!(mock.calls.lock().unwrap().len(), 1);
+    }
+
+    #[test]
+    fn virtual_desktop_restart_resolves_before_stopping_and_relaunches_exact_component() {
+        let component = "VirtualDesktop.Android/md59102214312e19799944a61bf7bc2f23e.VrActivity";
+        let mock = Arc::new(MockAdb::with_results(vec![
+            Ok(AdbOutput::success("device")),
+            Ok(AdbOutput::success(format!(
+                "priority=0 preferredOrder=0\n{component}\n"
+            ))),
+            Ok(AdbOutput::success("")),
+            Ok(AdbOutput::success("Starting")),
+        ]));
+        controller(mock.clone()).restart_virtual_desktop().unwrap();
+
+        let calls = mock.calls.lock().unwrap();
+        assert!(calls[1]
+            .iter()
+            .any(|argument| argument == "resolve-activity"));
+        assert!(calls[2]
+            .windows(2)
+            .any(|arguments| arguments == ["force-stop", VIRTUAL_DESKTOP_PACKAGE]));
+        assert!(calls[3]
+            .windows(2)
+            .any(|arguments| arguments == ["-n", component]));
+    }
+
+    #[test]
+    fn unresolved_virtual_desktop_activity_does_not_stop_the_app() {
+        let mock = Arc::new(MockAdb::with_results(vec![
+            Ok(AdbOutput::success("device")),
+            Ok(AdbOutput::success("No activity found")),
+        ]));
+        let error = controller(mock.clone())
+            .restart_virtual_desktop()
+            .unwrap_err();
+
+        assert!(matches!(error, AdbError::VirtualDesktopActivityUnavailable));
+        assert_eq!(mock.calls.lock().unwrap().len(), 2);
+    }
+
+    #[test]
+    fn virtual_desktop_restart_recovers_a_wedged_adb_server() {
+        let component = "VirtualDesktop.Android/test.VirtualDesktopActivity";
+        let mock = Arc::new(MockAdb::with_results(vec![
+            Err(AdbError::Timeout(Duration::from_millis(10))),
+            Ok(AdbOutput::success("device")),
+            Ok(AdbOutput::success(component)),
+            Ok(AdbOutput::success("")),
+            Ok(AdbOutput::success("Starting")),
+        ]));
+
+        controller(mock.clone()).restart_virtual_desktop().unwrap();
+
+        assert_eq!(mock.recoveries.load(Ordering::Relaxed), 1);
+        let calls = mock.calls.lock().unwrap();
+        assert_eq!(
+            calls
+                .iter()
+                .filter(|args| args.iter().any(|argument| argument == "get-state"))
+                .count(),
+            2
+        );
+    }
+
+    #[test]
+    fn virtual_desktop_stop_recovers_adb_before_quiescing_the_app() {
+        let mock = Arc::new(MockAdb::with_results(vec![
+            Err(AdbError::Timeout(Duration::from_millis(10))),
+            Ok(AdbOutput::success("device")),
+            Ok(AdbOutput::success("")),
+        ]));
+
+        controller(mock.clone()).stop_virtual_desktop().unwrap();
+
+        assert_eq!(mock.recoveries.load(Ordering::Relaxed), 1);
+        let calls = mock.calls.lock().unwrap();
+        assert!(calls[2]
+            .windows(2)
+            .any(|arguments| arguments == ["force-stop", VIRTUAL_DESKTOP_PACKAGE]));
     }
 
     #[test]
