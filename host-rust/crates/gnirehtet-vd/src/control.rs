@@ -55,6 +55,7 @@ pub struct ControlHandle {
     sender: mpsc::Sender<ControlCommand>,
     state: Arc<Mutex<StateMachine>>,
     observer: Arc<RwLock<Option<StateObserver>>>,
+    active_connection: Arc<StdMutex<Option<ActiveConnection>>>,
     publication: Arc<Mutex<()>>,
 }
 
@@ -149,6 +150,19 @@ impl ControlHandle {
         }
         snapshot
     }
+
+    /// Invalidates the current authenticated socket and records carrier loss.
+    /// Host resume recovery uses this after recreating ADB reverse mappings so
+    /// the relay cannot reopen on a control connection from the old mapping
+    /// generation.
+    pub async fn reset_transport(&self, reason: impl Into<String>) -> StateSnapshot {
+        if let Ok(active) = self.active_connection.lock() {
+            if let Some(active) = active.as_ref() {
+                let _ = active.cancel.send(true);
+            }
+        }
+        self.transport_lost(reason).await
+    }
 }
 
 #[derive(Clone, Debug)]
@@ -193,6 +207,7 @@ impl ControlServer {
         let observer = Arc::new(RwLock::new(None));
         let suspend_observer = Arc::new(RwLock::new(None));
         let wake_observer = Arc::new(RwLock::new(None));
+        let active_connection = Arc::new(StdMutex::new(None));
         let publication = Arc::new(Mutex::new(()));
         Ok(Self {
             config,
@@ -201,12 +216,13 @@ impl ControlServer {
             observer: observer.clone(),
             suspend_observer,
             wake_observer,
-            active_connection: Arc::new(StdMutex::new(None)),
+            active_connection: active_connection.clone(),
             commands: Arc::new(Mutex::new(command_rx)),
             handle: ControlHandle {
                 sender: command_tx,
                 state,
                 observer,
+                active_connection,
                 publication: publication.clone(),
             },
             publication,
@@ -894,6 +910,38 @@ mod tests {
             .await;
         assert_eq!(snapshot.state, HostState::Degraded);
         assert_eq!(*observed.lock().unwrap(), vec![HostState::Degraded]);
+    }
+
+    #[tokio::test]
+    async fn transport_reset_cancels_the_authenticated_socket() {
+        let session = SessionId([0x33; 16]);
+        let server = ControlServer::new(ControlConfig {
+            bind: "127.0.0.1:0".parse().unwrap(),
+            session_id: session,
+        })
+        .unwrap();
+        server
+            .state()
+            .lock()
+            .await
+            .peer_started(session, Instant::now())
+            .unwrap();
+        let (cancel, mut cancelled) = watch::channel(false);
+        server
+            .active_connection
+            .lock()
+            .unwrap()
+            .replace(ActiveConnection { epoch: 1, cancel });
+
+        let snapshot = server
+            .command_handle()
+            .reset_transport("host resume recovery")
+            .await;
+
+        cancelled.changed().await.unwrap();
+        assert!(*cancelled.borrow());
+        assert_eq!(snapshot.state, HostState::Degraded);
+        assert_eq!(snapshot.reason.as_deref(), Some("host resume recovery"));
     }
 
     #[tokio::test]

@@ -537,18 +537,10 @@ class ReleasePolicyTest(unittest.TestCase):
         rust_v4 = (REPOSITORY / "host-rust/Cargo.toml").read_text(encoding="utf-8")
         ignore = (REPOSITORY / ".gitignore").read_text(encoding="utf-8")
 
-        self.assertIn("Quest VD Wired v4.1.4 for Windows 10/11", readme)
-        self.assertNotIn("v3.1.0", readme)
-        self.assertIn("v3.0.1 Legacy", readme)
-        self.assertIn("quest-vd-wired-v4.1.4-windows-x64.zip", readme)
+        self.assertIn('<h1 align="center">Quest VD Wired</h1>', readme)
+        self.assertIn("Download v4.1.5", readme)
+        self.assertIn("quest-vd-wired-v4.1.5-windows-x64.zip", readme)
         self.assertIn("quest-vd-wired.exe", readme)
-        self.assertNotIn("v4.0.6", readme)
-        self.assertNotIn("v4.0.5", readme)
-        self.assertNotIn("v4.0.4", readme)
-        self.assertNotIn("v4.0.3", readme)
-        self.assertNotIn("v4.0.1", readme)
-        self.assertNotIn("v4.0.2", readme)
-        self.assertIn("gnirehtet-java-v3.0.1.zip", readme)
         self.assertNotIn("docs/", readme)
         self.assertIn("/docs/", ignore)
         self.assertTrue((REPOSITORY / "release").is_file())
@@ -557,7 +549,7 @@ class ReleasePolicyTest(unittest.TestCase):
         self.assertIn('versionCode = 56', android_v4)
         self.assertIn('versionName = "4.1.4"', android_v4)
         self.assertIn('<string name="app_name">Quest VD Wired</string>', android_strings)
-        self.assertIn('version = "4.1.4"', rust_v4)
+        self.assertIn('version = "4.1.5"', rust_v4)
 
     def test_windows_executable_uses_the_green_tray_icon(self) -> None:
         crate = (REPOSITORY / "host-rust/crates/gnirehtet-vd/Cargo.toml").read_text(

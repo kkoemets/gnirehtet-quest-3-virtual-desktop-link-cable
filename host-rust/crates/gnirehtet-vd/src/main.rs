@@ -75,6 +75,8 @@ enum Command {
     /// Internal foreground runtime used by `start`.
     #[command(hide = true)]
     Daemon(DaemonArgs),
+    #[command(hide = true)]
+    InstallVirtualDesktopRecovery,
 }
 
 #[derive(Debug, Args)]
@@ -130,6 +132,8 @@ enum DiagnosticsCommand {
 struct DaemonArgs {
     #[arg(long)]
     session: SessionId,
+    #[arg(long)]
+    all_traffic: bool,
 }
 
 #[tokio::main(flavor = "multi_thread", worker_threads = 2)]
@@ -145,7 +149,9 @@ async fn main() -> Result<()> {
 
     match cli.command {
         None => no_argument_entry(paths, adb_program, adb).await,
-        Some(Command::Daemon(args)) => run_foreground(args.session, paths, adb, adb_program).await,
+        Some(Command::Daemon(args)) => {
+            run_foreground(args.session, args.all_traffic, paths, adb, adb_program).await
+        }
         Some(command) => {
             #[cfg(target_os = "windows")]
             {
@@ -175,7 +181,7 @@ fn command_runs_client_side(command: &Command) -> bool {
         command,
         Command::Diagnostics(DiagnosticsArgs {
             command: DiagnosticsCommand::Capture { .. }
-        })
+        }) | Command::InstallVirtualDesktopRecovery
     )
 }
 
@@ -201,6 +207,17 @@ async fn execute_public_command(
             env!("CARGO_PKG_VERSION")
         )),
         Command::Daemon(_) => bail!("internal daemon commands cannot enter the public broker"),
+        Command::InstallVirtualDesktopRecovery => {
+            #[cfg(target_os = "windows")]
+            {
+                gnirehtet_vd::runtime::install_virtual_desktop_recovery_task()?;
+                Ok("Virtual Desktop recovery task installed".into())
+            }
+            #[cfg(not(target_os = "windows"))]
+            {
+                bail!("Virtual Desktop recovery task installation requires Windows")
+            }
+        }
     }
 }
 
@@ -354,6 +371,9 @@ impl TryFrom<Command> for BrokerCommand {
             },
             Command::Version => Self::Version,
             Command::Daemon(_) => bail!("the internal daemon cannot be forwarded to the broker"),
+            Command::InstallVirtualDesktopRecovery => {
+                bail!("the internal recovery installer cannot be forwarded to the broker")
+            }
         })
     }
 }
@@ -703,8 +723,32 @@ async fn serve_broker(
         // Deliberately await the complete command before creating the next pipe
         // instance. This is the broker's one-command-at-a-time ownership point.
         let _ = handle_broker_connection(server, &context).await;
-        server = gnirehtet_vd::runtime::create_secure_named_pipe(&name, false, 1)
-            .context("recreating the per-user broker pipe")?;
+        server = recreate_broker_pipe(&name).await?;
+    }
+}
+
+#[cfg(target_os = "windows")]
+async fn recreate_broker_pipe(
+    name: &str,
+) -> Result<tokio::net::windows::named_pipe::NamedPipeServer> {
+    use windows_sys::Win32::Foundation::ERROR_PIPE_BUSY;
+
+    let deadline = tokio::time::Instant::now() + BROKER_IO_TIMEOUT;
+    loop {
+        match gnirehtet_vd::runtime::create_secure_named_pipe(name, false, 1) {
+            Ok(server) => return Ok(server),
+            Err(error) if error.raw_os_error() == Some(ERROR_PIPE_BUSY as i32) => {
+                if tokio::time::Instant::now() >= deadline {
+                    return Err(
+                        anyhow::Error::new(error).context("recreating the per-user broker pipe")
+                    );
+                }
+                tokio::time::sleep(Duration::from_millis(25)).await;
+            }
+            Err(error) => {
+                return Err(anyhow::Error::new(error).context("recreating the per-user broker pipe"))
+            }
+        }
     }
 }
 
@@ -817,13 +861,20 @@ fn emit_broker_response(response: BrokerResponse) -> Result<()> {
 
 async fn run_foreground(
     session_id: SessionId,
+    all_traffic: bool,
     paths: AppPaths,
     adb: AdbController,
     adb_program: PathBuf,
 ) -> Result<()> {
-    HostRuntime::new(RuntimeConfig::new(session_id, paths, adb, adb_program))?
-        .run()
-        .await?;
+    HostRuntime::new(RuntimeConfig::new(
+        session_id,
+        all_traffic,
+        paths,
+        adb,
+        adb_program,
+    ))?
+    .run()
+    .await?;
     Ok(())
 }
 
@@ -841,18 +892,19 @@ async fn start(
     if runtime_may_be_active(paths) {
         bail!("host runtime activity exists without a verified daemon identity; refusing APK install/start");
     }
+    ensure_virtual_desktop_recovery_task()?;
     let apk_path = paths.root.join("gnirehtet-v4.apk");
     embedded::materialize(&apk_path)?;
     adb.install_matching_apk(&apk_path)?;
     let session = SessionId::random();
-    let mut daemon = spawn_daemon(daemon_adb, paths, session)?;
+    let all_traffic = args.routes_all_traffic();
+    let mut daemon = spawn_daemon(daemon_adb, paths, session, all_traffic)?;
     let daemon_pid = daemon.id();
     if let Err(error) = wait_for_runtime_ready(paths, daemon_pid).await {
         let _ = terminate_spawned_daemon(&mut daemon);
         return Err(error);
     }
 
-    let all_traffic = args.routes_all_traffic();
     let start_result = adb.start(session, all_traffic);
     if let Err(error) = start_result {
         let _ = terminate_spawned_daemon(&mut daemon);
@@ -873,6 +925,31 @@ async fn start(
             "Android did not acknowledge GNR4 STARTED; rollback could not verify VPN closure"
         } else {
             "Android did not acknowledge GNR4 STARTED; rollback completed"
+        };
+        let snapshot = StateSnapshot {
+            state: HostState::Error,
+            session_id: Some(session.to_string()),
+            missed_heartbeats: 0,
+            reason: Some(reason.into()),
+        };
+        let _ = StateStore::new(&paths.status).write(&snapshot, None);
+        if let Some(rollback_error) = rollback_error {
+            return Err(error.context(format!(
+                "startup rollback failed and VPN state remains unverified: {rollback_error}"
+            )));
+        }
+        return Err(error);
+    }
+    if let Err(error) =
+        connect_virtual_desktop_with_recovery(paths, session, adb, &mut daemon).await
+    {
+        terminate_spawned_daemon(&mut daemon)
+            .context("quiescing host monitor before startup rollback")?;
+        let rollback_error = adb.stop().err();
+        let reason = if rollback_error.is_some() {
+            "Virtual Desktop did not establish its wired channels; rollback could not verify VPN closure"
+        } else {
+            "Virtual Desktop did not establish its wired channels; rollback completed"
         };
         let snapshot = StateSnapshot {
             state: HostState::Error,
@@ -1153,7 +1230,12 @@ async fn diagnostics(
     }
 }
 
-fn spawn_daemon(adb: &std::path::Path, paths: &AppPaths, session: SessionId) -> Result<Child> {
+fn spawn_daemon(
+    adb: &std::path::Path,
+    paths: &AppPaths,
+    session: SessionId,
+    all_traffic: bool,
+) -> Result<Child> {
     let executable = std::env::current_exe().context("locating current executable")?;
     let mut command = ProcessCommand::new(executable);
     command
@@ -1161,7 +1243,11 @@ fn spawn_daemon(adb: &std::path::Path, paths: &AppPaths, session: SessionId) -> 
         .arg(&paths.root)
         .arg("daemon")
         .arg("--session")
-        .arg(session.to_string())
+        .arg(session.to_string());
+    if all_traffic {
+        command.arg("--all-traffic");
+    }
+    command
         .arg("--adb")
         .arg(adb)
         .stdin(Stdio::null())
@@ -1552,6 +1638,7 @@ enum TrayCoordinatorRequest {
     Wake {
         report_stop_error: bool,
     },
+    HostResume,
     Diagnose,
     Exit,
     External {
@@ -1566,6 +1653,7 @@ type TrayCoordinatorFuture<'a, T> =
 
 #[cfg(any(target_os = "windows", test))]
 trait TrayCoordinatorBackend: Send + Sync + 'static {
+    fn host_resume(&self) -> TrayCoordinatorFuture<'_, Result<()>>;
     fn diagnose(&self) -> TrayCoordinatorFuture<'_, Result<()>>;
     fn execute_external(&self, command: Command) -> TrayCoordinatorFuture<'_, Result<String>>;
     fn reconcile(&self) -> TrayCoordinatorFuture<'_, Result<bool>>;
@@ -1583,6 +1671,39 @@ struct WindowsTrayBackend {
 
 #[cfg(target_os = "windows")]
 impl TrayCoordinatorBackend for WindowsTrayBackend {
+    fn host_resume(&self) -> TrayCoordinatorFuture<'_, Result<()>> {
+        Box::pin(async move {
+            if !tray_desired_on()
+                || !read_daemon_pid(&self.context.paths.daemon_pid).is_some_and(process_is_running)
+            {
+                return Ok(());
+            }
+            let mut last_error = None;
+            for attempt in 0..3 {
+                match admin_command(&self.context.paths, "host_resume", Duration::from_secs(4))
+                    .await
+                {
+                    Ok(response) if response.ok => return Ok(()),
+                    Ok(response) => {
+                        last_error = Some(
+                            response
+                                .error
+                                .unwrap_or_else(|| "runtime rejected host resume recovery".into()),
+                        );
+                    }
+                    Err(error) => last_error = Some(error.to_string()),
+                }
+                if attempt < 2 {
+                    tokio::time::sleep(Duration::from_millis(500)).await;
+                }
+            }
+            bail!(
+                "runtime did not accept host resume recovery: {}",
+                last_error.unwrap_or_else(|| "unknown error".into())
+            )
+        })
+    }
+
     fn diagnose(&self) -> TrayCoordinatorFuture<'_, Result<()>> {
         Box::pin(async move {
             self.context
@@ -1774,6 +1895,13 @@ impl TrayCoordinatorHandle {
         }
     }
 
+    fn host_resume(&self) {
+        if tray_exit_requested() || !tray_desired_on() {
+            return;
+        }
+        let _ = self.sender.send(TrayCoordinatorRequest::HostResume);
+    }
+
     fn exit(&self) {
         TRAY_INTENT.store(TRAY_INTENT_EXITING, Ordering::Release);
         let _ = self.sender.send(TrayCoordinatorRequest::Exit);
@@ -1882,6 +2010,13 @@ async fn run_tray_coordinator<B>(
             TrayCoordinatorRequest::Wake { report_stop_error } => {
                 report_next_stop_error |= report_stop_error;
             }
+            TrayCoordinatorRequest::HostResume => {
+                if let Err(error) = backend.host_resume().await {
+                    backend.report_error(format!(
+                        "The wired link could not recover after Windows resumed: {error:#}"
+                    ));
+                }
+            }
             TrayCoordinatorRequest::Diagnose => {
                 if let Err(error) = backend.diagnose().await {
                     backend.report_error(format!("Diagnose and fix could not finish: {error:#}"));
@@ -1936,6 +2071,15 @@ const TRAY_EXIT_COMPLETE_MESSAGE: u32 = 0x8000 + 43;
 const TRAY_ERROR_MESSAGE: u32 = 0x8000 + 44;
 #[cfg(target_os = "windows")]
 const TRAY_ICON_TIMER_ID: usize = 41;
+#[cfg(any(target_os = "windows", test))]
+const WINDOWS_WM_POWERBROADCAST: u32 = 0x0218;
+#[cfg(any(target_os = "windows", test))]
+const WINDOWS_PBT_APMRESUMEAUTOMATIC: usize = 0x0012;
+
+#[cfg(any(target_os = "windows", test))]
+fn windows_power_event_is_resume(message: u32, wparam: usize) -> bool {
+    message == WINDOWS_WM_POWERBROADCAST && wparam == WINDOWS_PBT_APMRESUMEAUTOMATIC
+}
 
 #[cfg(target_os = "windows")]
 struct TrayInstance {
@@ -2132,6 +2276,12 @@ fn run_windows_tray(
         lparam: LPARAM,
     ) -> LRESULT {
         match message {
+            message if windows_power_event_is_resume(message, wparam) => {
+                if let Some(coordinator) = WINDOWS_TRAY_COORDINATOR.get() {
+                    coordinator.host_resume();
+                }
+                1
+            }
             TRAY_CALLBACK_MESSAGE => {
                 if matches!(lparam as u32, WM_RBUTTONUP | WM_LBUTTONDBLCLK) {
                     show_menu(hwnd);
@@ -2318,6 +2468,164 @@ fn wait_for_connected(paths: &AppPaths, session: SessionId, daemon: &mut Child) 
         thread::sleep(Duration::from_millis(50));
     }
     bail!("timed out after 30 seconds waiting for Android GNR4 STARTED")
+}
+
+async fn restart_virtual_desktop_on_quest(adb: &AdbController) -> Result<()> {
+    let restart_adb = adb.clone();
+    tokio::task::spawn_blocking(move || {
+        restart_adb
+            .restart_virtual_desktop()
+            .context("restarting Virtual Desktop on Quest")
+    })
+    .await
+    .context("Virtual Desktop restart task failed")??;
+    Ok(())
+}
+
+async fn connect_virtual_desktop_with_recovery(
+    paths: &AppPaths,
+    session: SessionId,
+    adb: &AdbController,
+    daemon: &mut Child,
+) -> Result<()> {
+    restart_virtual_desktop_on_quest(adb).await?;
+    let mut last_failure =
+        match wait_for_virtual_desktop_connected(paths, session, daemon, Duration::from_secs(45)) {
+            Ok(()) => return Ok(()),
+            Err(error) => error.to_string(),
+        };
+
+    for _ in 0..2 {
+        if daemon.try_wait()?.is_some() {
+            bail!("host daemon exited before Virtual Desktop established its wired channels");
+        }
+        let quiesce_adb = adb.clone();
+        match tokio::task::spawn_blocking(move || quiesce_adb.stop_virtual_desktop()).await {
+            Ok(Ok(())) => {}
+            Ok(Err(error)) => {
+                last_failure = format!("stopping Virtual Desktop on Quest failed: {error}");
+                continue;
+            }
+            Err(error) => {
+                last_failure = format!("Virtual Desktop stop task failed: {error}");
+                continue;
+            }
+        }
+        match tokio::task::spawn_blocking(gnirehtet_vd::runtime::restart_virtual_desktop_service)
+            .await
+        {
+            Ok(Ok(())) => {}
+            Ok(Err(error)) => {
+                last_failure = format!("Virtual Desktop host recovery failed: {error}");
+                continue;
+            }
+            Err(error) => {
+                last_failure = format!("Virtual Desktop host recovery task failed: {error}");
+                continue;
+            }
+        }
+        if let Err(error) = restart_virtual_desktop_on_quest(adb).await {
+            last_failure = error.to_string();
+            continue;
+        }
+        match wait_for_virtual_desktop_connected(paths, session, daemon, Duration::from_secs(45)) {
+            Ok(()) => return Ok(()),
+            Err(error) => last_failure = error.to_string(),
+        }
+    }
+
+    bail!("Virtual Desktop did not establish its wired channels: {last_failure}")
+}
+
+#[cfg(target_os = "windows")]
+fn ensure_virtual_desktop_recovery_task() -> Result<()> {
+    use std::ptr::{null, null_mut};
+    use windows_sys::Win32::UI::{Shell::ShellExecuteW, WindowsAndMessaging::SW_HIDE};
+
+    if gnirehtet_vd::runtime::virtual_desktop_recovery_task_ready()? {
+        return Ok(());
+    }
+    let executable = std::env::current_exe().context("locating current executable")?;
+    let verb = wide_windows("runas");
+    let executable = wide_windows(&executable.to_string_lossy());
+    let parameters = wide_windows("install-virtual-desktop-recovery");
+    let result = unsafe {
+        ShellExecuteW(
+            null_mut(),
+            verb.as_ptr(),
+            executable.as_ptr(),
+            parameters.as_ptr(),
+            null(),
+            SW_HIDE,
+        )
+    } as isize;
+    if result <= 32 {
+        bail!("Virtual Desktop recovery task authorization was declined or failed");
+    }
+    let deadline = Instant::now() + Duration::from_secs(30);
+    while Instant::now() < deadline {
+        if gnirehtet_vd::runtime::virtual_desktop_recovery_task_ready().unwrap_or(false) {
+            return Ok(());
+        }
+        thread::sleep(Duration::from_millis(250));
+    }
+    bail!("timed out installing the Virtual Desktop recovery task")
+}
+
+#[cfg(not(target_os = "windows"))]
+fn ensure_virtual_desktop_recovery_task() -> Result<()> {
+    Ok(())
+}
+
+fn wait_for_virtual_desktop_connected(
+    paths: &AppPaths,
+    session: SessionId,
+    daemon: &mut Child,
+    connection_timeout: Duration,
+) -> Result<()> {
+    const STABLE_DURATION: Duration = Duration::from_secs(3);
+
+    let deadline = Instant::now() + connection_timeout;
+    let store = StateStore::new(&paths.status);
+    let session_text = session.to_string();
+    let mut last_update = store.read_or_stopped().updated_unix_ms;
+    let mut connected_since = None;
+    while Instant::now() < deadline {
+        let status = store.read_or_stopped();
+        if status.lifecycle.session_id.as_deref() == Some(session_text.as_str()) {
+            if status.updated_unix_ms != last_update {
+                last_update = status.updated_unix_ms;
+                if status
+                    .telemetry
+                    .as_ref()
+                    .is_some_and(|telemetry| telemetry.relay.virtual_desktop.connected)
+                {
+                    let first_connected_update =
+                        connected_since.get_or_insert(status.updated_unix_ms);
+                    if status
+                        .updated_unix_ms
+                        .saturating_sub(*first_connected_update)
+                        >= STABLE_DURATION.as_millis()
+                    {
+                        return Ok(());
+                    }
+                } else {
+                    connected_since = None;
+                }
+            }
+            if status.lifecycle.state == HostState::Error {
+                bail!("wired runtime failed while waiting for Virtual Desktop channels")
+            }
+        }
+        if daemon.try_wait()?.is_some() {
+            bail!("host daemon exited before Virtual Desktop established its wired channels");
+        }
+        thread::sleep(Duration::from_millis(100));
+    }
+    bail!(
+        "timed out after {} seconds waiting for four stable Virtual Desktop channels",
+        connection_timeout.as_secs()
+    )
 }
 
 #[cfg(test)]
@@ -2565,6 +2873,7 @@ mod tests {
         outcomes: StdMutex<std::collections::VecDeque<FakeReconcileOutcome>>,
         calls: StdMutex<Vec<Instant>>,
         errors: StdMutex<Vec<String>>,
+        resume_calls: std::sync::atomic::AtomicUsize,
         active: std::sync::atomic::AtomicUsize,
         max_active: std::sync::atomic::AtomicUsize,
         operation_delay: Duration,
@@ -2593,6 +2902,7 @@ mod tests {
                     outcomes: StdMutex::new(outcomes.into_iter().collect()),
                     calls: StdMutex::new(Vec::new()),
                     errors: StdMutex::new(Vec::new()),
+                    resume_calls: std::sync::atomic::AtomicUsize::new(0),
                     active: std::sync::atomic::AtomicUsize::new(0),
                     max_active: std::sync::atomic::AtomicUsize::new(0),
                     operation_delay,
@@ -2606,6 +2916,13 @@ mod tests {
     }
 
     impl TrayCoordinatorBackend for FakeTrayBackend {
+        fn host_resume(&self) -> TrayCoordinatorFuture<'_, Result<()>> {
+            Box::pin(async move {
+                self.inner.resume_calls.fetch_add(1, Ordering::AcqRel);
+                Ok(())
+            })
+        }
+
         fn diagnose(&self) -> TrayCoordinatorFuture<'_, Result<()>> {
             Box::pin(async { Ok(()) })
         }
@@ -2677,6 +2994,35 @@ mod tests {
         worker.await.unwrap();
         assert_eq!(inspect.inner.max_active.load(Ordering::Acquire), 1);
         assert!(inspect.inner.errors.lock().unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn tray_coordinator_dispatches_host_resume_before_reconciliation() {
+        let backend = FakeTrayBackend::new([true], Duration::ZERO);
+        let inspect = backend.clone();
+        let (sender, receiver) = tokio::sync::mpsc::unbounded_channel();
+        let worker = tokio::spawn(run_tray_coordinator(receiver, backend));
+        sender.send(TrayCoordinatorRequest::HostResume).unwrap();
+        tokio::time::timeout(Duration::from_secs(1), async {
+            while inspect.inner.resume_calls.load(Ordering::Acquire) == 0
+                || inspect.call_times().is_empty()
+            {
+                tokio::time::sleep(Duration::from_millis(1)).await;
+            }
+        })
+        .await
+        .unwrap();
+        drop(sender);
+        worker.await.unwrap();
+        assert_eq!(inspect.inner.resume_calls.load(Ordering::Acquire), 1);
+        assert_eq!(inspect.call_times().len(), 1);
+    }
+
+    #[test]
+    fn only_automatic_windows_resume_requests_recovery() {
+        assert!(windows_power_event_is_resume(0x0218, 0x0012));
+        assert!(!windows_power_event_is_resume(0x0218, 0x0007));
+        assert!(!windows_power_event_is_resume(0x000F, 0x0012));
     }
 
     #[tokio::test]
@@ -2787,8 +3133,10 @@ mod tests {
         );
         assert!(BrokerCommand::try_from(Command::Daemon(DaemonArgs {
             session: SessionId([0x11; 16]),
+            all_traffic: false,
         }))
         .is_err());
+        assert!(BrokerCommand::try_from(Command::InstallVirtualDesktopRecovery).is_err());
         assert!(BrokerCommand::DiagnosticsCapture { duration: 0 }
             .into_public_command()
             .is_err());
