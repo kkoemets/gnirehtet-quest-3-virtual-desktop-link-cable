@@ -56,13 +56,15 @@ const TRANSPORT_RECOVERY_RETRY_DELAY: Duration = Duration::from_secs(1);
 const TRANSPORT_RECOVERY_CONTROL_TIMEOUT: Duration = Duration::from_secs(3);
 const VIRTUAL_DESKTOP_CONNECTION_TIMEOUT: Duration = Duration::from_secs(45);
 #[cfg(any(target_os = "windows", test))]
-const VIRTUAL_DESKTOP_CONNECTION_STABLE: Duration = Duration::from_secs(3);
+const VIRTUAL_DESKTOP_CONNECTION_STABLE: Duration = Duration::from_secs(10);
 #[cfg(any(target_os = "windows", test))]
 const VIRTUAL_DESKTOP_WATCHDOG_LOSS_GRACE: Duration = Duration::from_secs(8);
 #[cfg(target_os = "windows")]
 pub const VIRTUAL_DESKTOP_RECOVERY_TASK: &str = "Quest VD Wired - Virtual Desktop Recovery";
 #[cfg(target_os = "windows")]
 const VIRTUAL_DESKTOP_SERVICE_NAME: &str = "VirtualDesktop.Service.exe";
+#[cfg(target_os = "windows")]
+const VIRTUAL_DESKTOP_RECOVERY_ARGUMENTS: &str = r#"-NoProfile -NonInteractive -WindowStyle Hidden -Command "$ErrorActionPreference='Stop';$session=(Get-Process -Id $PID).SessionId;$p=@(Get-Process -Name 'VirtualDesktop.Streamer' -ErrorAction SilentlyContinue|Where-Object {$_.SessionId -eq $session});if($p){$p|Stop-Process -Force};Restart-Service -Name VirtualDesktop.Service.exe -Force""#;
 
 #[derive(Clone, Debug)]
 pub struct AppPaths {
@@ -343,6 +345,16 @@ pub enum TransportRecoveryState {
 pub enum TransportRecoveryTrigger {
     HostResume,
     UsbReconnect,
+}
+
+fn should_reset_virtual_desktop_service(
+    trigger: TransportRecoveryTrigger,
+    _relaunch_attempt: u32,
+) -> bool {
+    matches!(
+        trigger,
+        TransportRecoveryTrigger::HostResume | TransportRecoveryTrigger::UsbReconnect
+    )
 }
 
 #[derive(Clone, Copy, Debug, Default, Deserialize, Eq, PartialEq, Serialize)]
@@ -821,7 +833,7 @@ impl AdbHealthMonitor {
             let mut child = match spawn_track_devices(&config.adb_program) {
                 Ok(child) => child,
                 Err(_) => {
-                    self.track_failed(&control, &store, &diagnostics, "track_spawn_failed")
+                    self.track_failed(adb, &control, &store, &diagnostics, "track_spawn_failed")
                         .await;
                     if sleep_or_stop(&self, backoff).await {
                         return;
@@ -832,15 +844,27 @@ impl AdbHealthMonitor {
             };
             let Some(stdout) = child.stdout.take() else {
                 let _ = child.kill().await;
-                self.track_failed(&control, &store, &diagnostics, "track_stdout_unavailable")
-                    .await;
+                self.track_failed(
+                    adb,
+                    &control,
+                    &store,
+                    &diagnostics,
+                    "track_stdout_unavailable",
+                )
+                .await;
                 if sleep_or_stop(&self, backoff).await {
                     return;
                 }
                 backoff = next_backoff(backoff, MAX_BACKOFF);
                 continue;
             };
-            self.update_status(true, false, false, None);
+            let previous = self.snapshot();
+            self.update_status(
+                true,
+                previous.device_available,
+                previous.mappings_healthy,
+                None,
+            );
             let mut stdout = stdout;
             let mut read_buffer = [0u8; 4096];
             let mut decoder = TrackDevicesDecoder::default();
@@ -999,7 +1023,7 @@ impl AdbHealthMonitor {
                 return;
             }
             if let Some(category) = tracker_failed {
-                self.track_failed(&control, &store, &diagnostics, category)
+                self.track_failed(adb, &control, &store, &diagnostics, category)
                     .await;
                 if sleep_or_stop(&self, backoff).await {
                     return;
@@ -1044,7 +1068,7 @@ impl AdbHealthMonitor {
         }
         let mut failure_category = "virtual_desktop_connection_timeout";
         for relaunch_attempt in 1..=3 {
-            if relaunch_attempt > 1 {
+            if should_reset_virtual_desktop_service(trigger, relaunch_attempt) {
                 let quiesce_adb = config.adb.clone();
                 let quiesced = task::spawn_blocking(move || {
                     quiesce_adb
@@ -1492,11 +1516,33 @@ impl AdbHealthMonitor {
 
     async fn track_failed(
         &self,
+        adb: &AdbController,
         control: &ControlHandle,
         store: &StateStore,
         diagnostics: &Diagnostics,
         category: &'static str,
     ) {
+        if category == "track_decode_failed" {
+            let previous = self.snapshot();
+            let probe_adb = adb.clone();
+            let device_confirmed = matches!(
+                task::spawn_blocking(move || probe_adb.device_state()).await,
+                Ok(Ok(state)) if state == "device"
+            );
+            if device_confirmed {
+                self.update_status(
+                    false,
+                    true,
+                    previous.device_available && previous.mappings_healthy,
+                    Some(category.into()),
+                );
+                let _ = diagnostics.record(
+                    "adb_monitor_failure",
+                    json!({"category": category, "device_confirmed": true}),
+                );
+                return;
+            }
+        }
         self.update_status(false, false, false, Some(category.into()));
         if matches!(
             control.snapshot().await.state,
@@ -1510,7 +1556,10 @@ impl AdbHealthMonitor {
         // failed track process is different: clear that active bit throughout
         // restart backoff so status never presents stale monitor health.
         self.update_status(false, false, false, Some(category.into()));
-        let _ = diagnostics.record("adb_monitor_failure", json!({"category": category}));
+        let _ = diagnostics.record(
+            "adb_monitor_failure",
+            json!({"category": category, "device_confirmed": false}),
+        );
     }
 
     fn update_status(
@@ -3130,19 +3179,24 @@ pub fn virtual_desktop_recovery_task_ready() -> io::Result<bool> {
         format!("<userid>{sid}</userid>"),
         "<logontype>interactivetoken</logontype>".into(),
         "<runlevel>highestavailable</runlevel>".into(),
-        "<command>c:\\windows\\system32\\windowspowershell\\v1.0\\powershell.exe</command>"
-            .into(),
-        "<arguments>-noprofile -noninteractive -windowstyle hidden -command \"restart-service -name virtualdesktop.service.exe -force\"</arguments>".into(),
+        "<command>c:\\windows\\system32\\windowspowershell\\v1.0\\powershell.exe</command>".into(),
+        format!(
+            "<arguments>{}</arguments>",
+            VIRTUAL_DESKTOP_RECOVERY_ARGUMENTS.to_ascii_lowercase()
+        ),
     ];
     Ok(required.iter().all(|value| xml.contains(value)))
 }
 
 #[cfg(target_os = "windows")]
 pub fn install_virtual_desktop_recovery_task() -> io::Result<()> {
-    const SCRIPT: &str = r#"$ErrorActionPreference='Stop';$a=New-ScheduledTaskAction -Execute 'C:\Windows\System32\WindowsPowerShell\v1.0\powershell.exe' -Argument '-NoProfile -NonInteractive -WindowStyle Hidden -Command \"Restart-Service -Name VirtualDesktop.Service.exe -Force\"';$p=New-ScheduledTaskPrincipal -UserId ([System.Security.Principal.WindowsIdentity]::GetCurrent().User.Value) -LogonType Interactive -RunLevel Highest;$s=New-ScheduledTaskSettingsSet -ExecutionTimeLimit (New-TimeSpan -Minutes 1) -AllowStartIfOnBatteries -DontStopIfGoingOnBatteries -MultipleInstances IgnoreNew;Register-ScheduledTask -TaskName 'Quest VD Wired - Virtual Desktop Recovery' -Action $a -Principal $p -Settings $s -Force | Out-Null"#;
+    let arguments = VIRTUAL_DESKTOP_RECOVERY_ARGUMENTS.replace('\'', "''");
+    let script = format!(
+        "$ErrorActionPreference='Stop';$a=New-ScheduledTaskAction -Execute 'C:\\Windows\\System32\\WindowsPowerShell\\v1.0\\powershell.exe' -Argument '{arguments}';$p=New-ScheduledTaskPrincipal -UserId ([System.Security.Principal.WindowsIdentity]::GetCurrent().User.Value) -LogonType Interactive -RunLevel Highest;$s=New-ScheduledTaskSettingsSet -ExecutionTimeLimit (New-TimeSpan -Minutes 1) -AllowStartIfOnBatteries -DontStopIfGoingOnBatteries -MultipleInstances IgnoreNew;Register-ScheduledTask -TaskName 'Quest VD Wired - Virtual Desktop Recovery' -Action $a -Principal $p -Settings $s -Force | Out-Null"
+    );
     let (status, _) = command_text_with_timeout(
         "powershell.exe",
-        &["-NoProfile", "-NonInteractive", "-Command", SCRIPT],
+        &["-NoProfile", "-NonInteractive", "-Command", &script],
         Duration::from_secs(20),
     )?;
     if !status.success() {
@@ -3198,21 +3252,6 @@ fn virtual_desktop_streamer_pid() -> io::Result<u32> {
 }
 
 #[cfg(target_os = "windows")]
-fn stop_virtual_desktop_streamer() -> io::Result<()> {
-    let script = "$ErrorActionPreference='Stop';$session=(Get-Process -Id $PID).SessionId;$p=@(Get-Process -Name 'VirtualDesktop.Streamer' -ErrorAction SilentlyContinue|Where-Object {$_.SessionId -eq $session});if($p.Count -gt 0){$p|Stop-Process -Force}";
-    let (status, _) = command_text_with_timeout(
-        "powershell.exe",
-        &["-NoProfile", "-NonInteractive", "-Command", script],
-        Duration::from_secs(5),
-    )?;
-    if status.success() {
-        Ok(())
-    } else {
-        Err(io::Error::other("stopping Virtual Desktop Streamer failed"))
-    }
-}
-
-#[cfg(target_os = "windows")]
 fn virtual_desktop_streamer_cloud_ready(pid: u32) -> io::Result<bool> {
     let script = format!(
         "$c=@(Get-NetTCPConnection -OwningProcess {pid} -State Established -ErrorAction SilentlyContinue);$cloud=@($c|Where-Object {{$_.RemotePort -eq 443}}).Count -gt 0;$broker=@($c|Where-Object {{$_.RemotePort -ge 38810 -and $_.RemotePort -le 38820}}).Count -gt 0;if($cloud -and $broker){{1}}else{{0}}"
@@ -3246,7 +3285,6 @@ pub fn restart_virtual_desktop_service() -> io::Result<()> {
     }
     let previous_pid = virtual_desktop_service_pid()?;
     let previous_streamer_pid = virtual_desktop_streamer_pid()?;
-    stop_virtual_desktop_streamer()?;
     let (status, _) = command_text_with_timeout(
         "schtasks.exe",
         &["/Run", "/TN", VIRTUAL_DESKTOP_RECOVERY_TASK],
@@ -3514,6 +3552,7 @@ mod tests {
 
     struct MonitorMockAdb {
         calls: StdMutex<Vec<Vec<String>>>,
+        device_available: AtomicBool,
         mapping_adds: AtomicU64,
         mapping_delay_ms: AtomicU64,
         screen_suspended: AtomicBool,
@@ -3524,6 +3563,7 @@ mod tests {
         fn default() -> Self {
             Self {
                 calls: StdMutex::new(Vec::new()),
+                device_available: AtomicBool::new(true),
                 mapping_adds: AtomicU64::new(0),
                 mapping_delay_ms: AtomicU64::new(0),
                 screen_suspended: AtomicBool::new(false),
@@ -3536,7 +3576,13 @@ mod tests {
         fn execute(&self, args: &[String], _timeout: Duration) -> Result<AdbOutput, AdbError> {
             self.calls.lock().unwrap().push(args.to_vec());
             if args.iter().any(|argument| argument == "get-state") {
-                return Ok(AdbOutput::success("device\n"));
+                return Ok(AdbOutput::success(
+                    if self.device_available.load(Ordering::Relaxed) {
+                        "device\n"
+                    } else {
+                        "offline\n"
+                    },
+                ));
             }
             if args.iter().any(|argument| argument == "resolve-activity") {
                 return Ok(AdbOutput::success(
@@ -4116,6 +4162,22 @@ mod tests {
             monitor.snapshot().transport_recovery.state,
             TransportRecoveryState::Failed
         );
+    }
+
+    #[test]
+    fn transport_recovery_resets_the_virtual_desktop_service_before_the_first_relaunch() {
+        assert!(should_reset_virtual_desktop_service(
+            TransportRecoveryTrigger::HostResume,
+            1,
+        ));
+        assert!(should_reset_virtual_desktop_service(
+            TransportRecoveryTrigger::UsbReconnect,
+            1,
+        ));
+        assert!(should_reset_virtual_desktop_service(
+            TransportRecoveryTrigger::UsbReconnect,
+            2,
+        ));
     }
 
     #[tokio::test]
@@ -4911,7 +4973,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn tracker_failure_clears_active_and_device_state_during_backoff() {
+    async fn tracker_decode_failure_preserves_a_confirmed_carrier() {
         let directory = tempfile::tempdir().unwrap();
         let paths = AppPaths::discover(Some(directory.path().to_owned())).unwrap();
         let diagnostics = Diagnostics::open(&paths.logs).unwrap();
@@ -4929,12 +4991,14 @@ mod tests {
             .peer_started(session, std::time::Instant::now())
             .unwrap();
         let monitor = AdbHealthMonitor::default();
+        let adb = AdbController::new(Arc::new(MonitorMockAdb::default()));
         let relay_gate = RelayGate::default();
         relay_gate.set_enabled(true);
         let connected_generation = relay_gate.generation();
         monitor.update_status(true, true, true, None);
         monitor
             .track_failed(
+                &adb,
                 &control.command_handle(),
                 &store,
                 &diagnostics,
@@ -4943,9 +5007,91 @@ mod tests {
             .await;
         let snapshot = monitor.snapshot();
         assert!(!snapshot.active);
-        assert!(!snapshot.device_available);
-        assert!(!snapshot.mappings_healthy);
+        assert!(snapshot.device_available);
+        assert!(snapshot.mappings_healthy);
         assert!(relay_gate.is_enabled());
         assert_eq!(relay_gate.generation(), connected_generation);
+        assert_eq!(control.state().lock().await.state(), HostState::Connected);
+        assert!(!monitor.usb_reconnect_pending.load(Ordering::Acquire));
+    }
+
+    #[tokio::test]
+    async fn tracker_decode_failure_clears_an_unconfirmed_carrier() {
+        let directory = tempfile::tempdir().unwrap();
+        let paths = AppPaths::discover(Some(directory.path().to_owned())).unwrap();
+        let diagnostics = Diagnostics::open(&paths.logs).unwrap();
+        let store = StateStore::new(&paths.status);
+        let session = SessionId([0x7b; 16]);
+        let control = ControlServer::new(ControlConfig {
+            bind: "127.0.0.1:0".parse().unwrap(),
+            session_id: session,
+        })
+        .unwrap();
+        control
+            .state()
+            .lock()
+            .await
+            .peer_started(session, std::time::Instant::now())
+            .unwrap();
+        let monitor = AdbHealthMonitor::default();
+        let mock = Arc::new(MonitorMockAdb::default());
+        mock.device_available.store(false, Ordering::Relaxed);
+        let adb = AdbController::new(mock);
+        monitor.update_status(true, true, true, None);
+        monitor
+            .track_failed(
+                &adb,
+                &control.command_handle(),
+                &store,
+                &diagnostics,
+                "track_decode_failed",
+            )
+            .await;
+
+        let snapshot = monitor.snapshot();
+        assert!(!snapshot.active);
+        assert!(!snapshot.device_available);
+        assert!(!snapshot.mappings_healthy);
+        assert_eq!(control.state().lock().await.state(), HostState::Degraded);
+        assert!(monitor.usb_reconnect_pending.load(Ordering::Acquire));
+    }
+
+    #[tokio::test]
+    async fn tracker_transport_failure_remains_fail_closed() {
+        let directory = tempfile::tempdir().unwrap();
+        let paths = AppPaths::discover(Some(directory.path().to_owned())).unwrap();
+        let diagnostics = Diagnostics::open(&paths.logs).unwrap();
+        let store = StateStore::new(&paths.status);
+        let session = SessionId([0x7c; 16]);
+        let control = ControlServer::new(ControlConfig {
+            bind: "127.0.0.1:0".parse().unwrap(),
+            session_id: session,
+        })
+        .unwrap();
+        control
+            .state()
+            .lock()
+            .await
+            .peer_started(session, std::time::Instant::now())
+            .unwrap();
+        let monitor = AdbHealthMonitor::default();
+        let adb = AdbController::new(Arc::new(MonitorMockAdb::default()));
+        monitor.update_status(true, true, true, None);
+        monitor
+            .track_failed(
+                &adb,
+                &control.command_handle(),
+                &store,
+                &diagnostics,
+                "track_read_failed",
+            )
+            .await;
+
+        let snapshot = monitor.snapshot();
+        assert!(!snapshot.active);
+        assert!(!snapshot.device_available);
+        assert!(!snapshot.mappings_healthy);
+        assert_eq!(control.state().lock().await.state(), HostState::Degraded);
+        assert!(monitor.usb_reconnect_pending.load(Ordering::Acquire));
     }
 }
