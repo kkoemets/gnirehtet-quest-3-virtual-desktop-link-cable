@@ -538,8 +538,8 @@ class ReleasePolicyTest(unittest.TestCase):
         ignore = (REPOSITORY / ".gitignore").read_text(encoding="utf-8")
 
         self.assertIn('<h1 align="center">Quest VD Wired</h1>', readme)
-        self.assertIn("Download v4.1.6", readme)
-        self.assertIn("quest-vd-wired-v4.1.6-windows-x64.zip", readme)
+        self.assertIn("Download v4.1.7", readme)
+        self.assertIn("quest-vd-wired-v4.1.7-windows-x64.zip", readme)
         self.assertIn("quest-vd-wired.exe", readme)
         self.assertNotIn("docs/", readme)
         self.assertIn("/docs/", ignore)
@@ -549,7 +549,7 @@ class ReleasePolicyTest(unittest.TestCase):
         self.assertIn('versionCode = 56', android_v4)
         self.assertIn('versionName = "4.1.4"', android_v4)
         self.assertIn('<string name="app_name">Quest VD Wired</string>', android_strings)
-        self.assertIn('version = "4.1.6"', rust_v4)
+        self.assertIn('version = "4.1.7"', rust_v4)
 
     def test_windows_executable_uses_the_green_tray_icon(self) -> None:
         crate = (REPOSITORY / "host-rust/crates/gnirehtet-vd/Cargo.toml").read_text(

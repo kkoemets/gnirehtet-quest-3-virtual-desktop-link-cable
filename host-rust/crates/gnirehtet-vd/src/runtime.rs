@@ -1,4 +1,5 @@
 use std::{
+    collections::HashSet,
     env, fs, io,
     net::{Ipv4Addr, SocketAddr},
     path::{Path, PathBuf},
@@ -53,6 +54,7 @@ const ADMIN_IO_TIMEOUT: Duration = Duration::from_secs(3);
 const TRANSPORT_RECOVERY_REASON: &str = "rebuilding the wired transport generation";
 const TRANSPORT_RECOVERY_MAX_ATTEMPTS: u32 = 2;
 const TRANSPORT_RECOVERY_RETRY_DELAY: Duration = Duration::from_secs(1);
+const TRANSPORT_RECOVERY_REARM_DELAY: Duration = Duration::from_secs(30);
 const TRANSPORT_RECOVERY_CONTROL_TIMEOUT: Duration = Duration::from_secs(3);
 const VIRTUAL_DESKTOP_CONNECTION_TIMEOUT: Duration = Duration::from_secs(45);
 #[cfg(any(target_os = "windows", test))]
@@ -374,6 +376,8 @@ pub struct AdbHealthMonitor {
     mapping_probe_last_us: Arc<AtomicU64>,
     mapping_probe_max_us: Arc<AtomicU64>,
     transport_recovery: Arc<StdMutex<TransportRecoverySnapshot>>,
+    transport_auto_rearm_generation: Arc<AtomicU64>,
+    transport_rearm_scheduled: Arc<StdMutex<HashSet<u64>>>,
     usb_reconnect_pending: Arc<AtomicBool>,
     status: Arc<StdMutex<AdbMonitorSnapshot>>,
     operation: Arc<Mutex<()>>,
@@ -592,6 +596,8 @@ impl AdbHealthMonitor {
     }
 
     fn notify_transport_recovery(&self, trigger: TransportRecoveryTrigger) -> u64 {
+        self.transport_auto_rearm_generation
+            .store(0, Ordering::Release);
         let generation = if let Ok(mut recovery) = self.transport_recovery.lock() {
             recovery.generation = recovery.generation.wrapping_add(1);
             recovery.attempt = 0;
@@ -604,6 +610,95 @@ impl AdbHealthMonitor {
         self.sync_transport_recovery_status(Some("transport_recovery_pending".into()));
         self.changed.notify_one();
         generation
+    }
+
+    fn rearm_failed_transport(
+        &self,
+        generation: u64,
+        trigger: TransportRecoveryTrigger,
+    ) -> Option<u64> {
+        if self.stopping.load(Ordering::Acquire)
+            || self.transport_auto_rearm_generation.load(Ordering::Acquire) == generation
+        {
+            return None;
+        }
+        let next_generation = if let Ok(mut recovery) = self.transport_recovery.lock() {
+            if recovery.generation != generation || recovery.state != TransportRecoveryState::Failed
+            {
+                return None;
+            }
+            recovery.generation = recovery.generation.wrapping_add(1);
+            recovery.attempt = 0;
+            recovery.state = TransportRecoveryState::Pending;
+            recovery.trigger = Some(trigger);
+            recovery.generation
+        } else {
+            return None;
+        };
+        self.transport_auto_rearm_generation
+            .store(next_generation, Ordering::Release);
+        self.sync_transport_recovery_status(Some("transport_recovery_rearmed".into()));
+        self.changed.notify_one();
+        Some(next_generation)
+    }
+
+    fn schedule_transport_recovery_rearm(
+        &self,
+        generation: u64,
+        trigger: TransportRecoveryTrigger,
+        diagnostics: &Diagnostics,
+    ) {
+        self.schedule_transport_recovery_rearm_after(
+            generation,
+            trigger,
+            diagnostics,
+            TRANSPORT_RECOVERY_REARM_DELAY,
+        );
+    }
+
+    fn schedule_transport_recovery_rearm_after(
+        &self,
+        generation: u64,
+        trigger: TransportRecoveryTrigger,
+        diagnostics: &Diagnostics,
+        delay: Duration,
+    ) {
+        if self.transport_auto_rearm_generation.load(Ordering::Acquire) == generation {
+            return;
+        }
+        let scheduled = self
+            .transport_rearm_scheduled
+            .lock()
+            .is_ok_and(|mut scheduled| scheduled.insert(generation));
+        if !scheduled {
+            return;
+        }
+        let _ = diagnostics.record(
+            "transport_recovery_rearm_scheduled",
+            json!({
+                "generation": generation,
+                "trigger": trigger,
+                "delay_ms": delay.as_millis().min(u64::MAX as u128) as u64,
+            }),
+        );
+        let monitor = self.clone();
+        let diagnostics = diagnostics.clone();
+        tokio::spawn(async move {
+            time::sleep(delay).await;
+            if let Ok(mut scheduled) = monitor.transport_rearm_scheduled.lock() {
+                scheduled.remove(&generation);
+            }
+            if let Some(next_generation) = monitor.rearm_failed_transport(generation, trigger) {
+                let _ = diagnostics.record(
+                    "transport_recovery_rearmed",
+                    json!({
+                        "previous_generation": generation,
+                        "generation": next_generation,
+                        "trigger": trigger,
+                    }),
+                );
+            }
+        });
     }
 
     fn transport_requires_recovery(&self) -> bool {
@@ -1183,6 +1278,8 @@ impl AdbHealthMonitor {
                 time::sleep(TRANSPORT_RECOVERY_RETRY_DELAY).await;
                 changed.notify_one();
             });
+        } else {
+            self.schedule_transport_recovery_rearm(generation, trigger, diagnostics);
         }
         true
     }
@@ -1304,6 +1401,13 @@ impl AdbHealthMonitor {
                                 "will_retry": will_retry,
                             }),
                         );
+                        if !will_retry {
+                            monitor.schedule_transport_recovery_rearm(
+                                recovery_generation,
+                                trigger,
+                                &diagnostics,
+                            );
+                        }
                     }
                 });
             }
@@ -1335,6 +1439,12 @@ impl AdbHealthMonitor {
                         time::sleep(TRANSPORT_RECOVERY_RETRY_DELAY).await;
                         changed.notify_one();
                     });
+                } else {
+                    self.schedule_transport_recovery_rearm(
+                        recovery_generation,
+                        trigger,
+                        diagnostics,
+                    );
                 }
             }
             Err(_) => {
@@ -1365,6 +1475,12 @@ impl AdbHealthMonitor {
                         time::sleep(TRANSPORT_RECOVERY_RETRY_DELAY).await;
                         changed.notify_one();
                     });
+                } else {
+                    self.schedule_transport_recovery_rearm(
+                        recovery_generation,
+                        trigger,
+                        diagnostics,
+                    );
                 }
             }
         }
@@ -3214,9 +3330,9 @@ pub fn install_virtual_desktop_recovery_task() -> io::Result<()> {
 
 #[cfg(target_os = "windows")]
 fn virtual_desktop_service_pid() -> io::Result<u32> {
+    let service_name = VIRTUAL_DESKTOP_SERVICE_NAME;
     let script = format!(
-        "$s=Get-CimInstance Win32_Service -Filter \"Name='{}'\" -ErrorAction Stop;if($s.State -eq 'Running'){{$s.ProcessId}}else{{0}}",
-        VIRTUAL_DESKTOP_SERVICE_NAME
+        "$s=Get-CimInstance Win32_Service -Filter \"Name='{service_name}'\" -ErrorAction Stop;if($s.State -eq 'Running'){{$s.ProcessId}}else{{0}}"
     );
     let (status, output) = command_text_with_timeout(
         "powershell.exe",
@@ -4158,6 +4274,109 @@ mod tests {
         );
         assert!(!monitor.finish_transport_recovery_attempt(1, false));
         assert_eq!(monitor.begin_transport_recovery_attempt(), None);
+        assert_eq!(
+            monitor.snapshot().transport_recovery.state,
+            TransportRecoveryState::Failed
+        );
+    }
+
+    #[test]
+    fn terminal_recovery_rearms_exactly_once_per_external_generation() {
+        let monitor = AdbHealthMonitor::default();
+        let generation = monitor.notify_host_resume();
+        assert_eq!(
+            monitor.begin_transport_recovery_attempt(),
+            Some((generation, 1, TransportRecoveryTrigger::HostResume))
+        );
+        assert!(monitor.finish_transport_recovery_attempt(generation, false));
+        assert_eq!(
+            monitor.begin_transport_recovery_attempt(),
+            Some((generation, 2, TransportRecoveryTrigger::HostResume))
+        );
+        assert!(!monitor.finish_transport_recovery_attempt(generation, false));
+
+        let fallback_generation = monitor
+            .rearm_failed_transport(generation, TransportRecoveryTrigger::HostResume)
+            .unwrap();
+        let snapshot = monitor.snapshot();
+        assert_eq!(snapshot.transport_recovery.generation, fallback_generation);
+        assert_eq!(snapshot.transport_recovery.attempt, 0);
+        assert_eq!(
+            snapshot.transport_recovery.state,
+            TransportRecoveryState::Pending
+        );
+        assert_eq!(
+            snapshot.last_error.as_deref(),
+            Some("transport_recovery_rearmed")
+        );
+
+        assert_eq!(
+            monitor.begin_transport_recovery_attempt(),
+            Some((fallback_generation, 1, TransportRecoveryTrigger::HostResume,))
+        );
+        assert!(monitor.finish_transport_recovery_attempt(fallback_generation, false));
+        assert_eq!(
+            monitor.begin_transport_recovery_attempt(),
+            Some((fallback_generation, 2, TransportRecoveryTrigger::HostResume,))
+        );
+        assert!(!monitor.finish_transport_recovery_attempt(fallback_generation, false));
+        assert_eq!(
+            monitor
+                .rearm_failed_transport(fallback_generation, TransportRecoveryTrigger::HostResume,),
+            None
+        );
+
+        let next_external_generation = monitor.notify_host_resume();
+        assert!(next_external_generation > fallback_generation);
+        assert_eq!(
+            monitor.begin_transport_recovery_attempt(),
+            Some((
+                next_external_generation,
+                1,
+                TransportRecoveryTrigger::HostResume,
+            ))
+        );
+    }
+
+    #[tokio::test]
+    async fn terminal_recovery_scheduler_rearms_once_after_its_delay() {
+        let directory = tempfile::tempdir().unwrap();
+        let paths = AppPaths::discover(Some(directory.path().to_owned())).unwrap();
+        let diagnostics = Diagnostics::open(&paths.logs).unwrap();
+        let monitor = AdbHealthMonitor::default();
+        let generation = monitor.notify_host_resume();
+        monitor.begin_transport_recovery_attempt().unwrap();
+        assert!(monitor.finish_transport_recovery_attempt(generation, false));
+        monitor.begin_transport_recovery_attempt().unwrap();
+        assert!(!monitor.finish_transport_recovery_attempt(generation, false));
+
+        for _ in 0..2 {
+            monitor.schedule_transport_recovery_rearm_after(
+                generation,
+                TransportRecoveryTrigger::HostResume,
+                &diagnostics,
+                Duration::from_millis(10),
+            );
+        }
+        time::sleep(Duration::from_millis(50)).await;
+
+        let fallback = monitor.snapshot().transport_recovery;
+        assert_eq!(fallback.generation, generation + 1);
+        assert_eq!(fallback.attempt, 0);
+        assert_eq!(fallback.state, TransportRecoveryState::Pending);
+        assert!(monitor.transport_rearm_scheduled.lock().unwrap().is_empty());
+
+        monitor.begin_transport_recovery_attempt().unwrap();
+        assert!(monitor.finish_transport_recovery_attempt(fallback.generation, false));
+        monitor.begin_transport_recovery_attempt().unwrap();
+        assert!(!monitor.finish_transport_recovery_attempt(fallback.generation, false));
+        monitor.schedule_transport_recovery_rearm_after(
+            fallback.generation,
+            TransportRecoveryTrigger::HostResume,
+            &diagnostics,
+            Duration::from_millis(10),
+        );
+        time::sleep(Duration::from_millis(50)).await;
         assert_eq!(
             monitor.snapshot().transport_recovery.state,
             TransportRecoveryState::Failed
