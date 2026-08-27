@@ -57,6 +57,8 @@ const TRANSPORT_RECOVERY_RETRY_DELAY: Duration = Duration::from_secs(1);
 const TRANSPORT_RECOVERY_REARM_DELAY: Duration = Duration::from_secs(30);
 const TRANSPORT_RECOVERY_CONTROL_TIMEOUT: Duration = Duration::from_secs(3);
 const VIRTUAL_DESKTOP_CONNECTION_TIMEOUT: Duration = Duration::from_secs(45);
+const VIRTUAL_DESKTOP_FULL_RECOVERY_ATTEMPTS: u32 = 1;
+const VIRTUAL_DESKTOP_RETRY_DELAY: Duration = Duration::from_secs(30);
 #[cfg(any(target_os = "windows", test))]
 const VIRTUAL_DESKTOP_CONNECTION_STABLE: Duration = Duration::from_secs(10);
 #[cfg(any(target_os = "windows", test))]
@@ -338,6 +340,7 @@ pub enum TransportRecoveryState {
     RebuildingMappings,
     AwaitingControl,
     RestartingVirtualDesktop,
+    WaitingForVirtualDesktop,
     Recovered,
     Failed,
 }
@@ -351,12 +354,13 @@ pub enum TransportRecoveryTrigger {
 
 fn should_reset_virtual_desktop_service(
     trigger: TransportRecoveryTrigger,
-    _relaunch_attempt: u32,
+    relaunch_attempt: u32,
 ) -> bool {
-    matches!(
-        trigger,
-        TransportRecoveryTrigger::HostResume | TransportRecoveryTrigger::UsbReconnect
-    )
+    relaunch_attempt == 1
+        && matches!(
+            trigger,
+            TransportRecoveryTrigger::HostResume | TransportRecoveryTrigger::UsbReconnect
+        )
 }
 
 #[derive(Clone, Copy, Debug, Default, Deserialize, Eq, PartialEq, Serialize)]
@@ -378,6 +382,7 @@ pub struct AdbHealthMonitor {
     transport_recovery: Arc<StdMutex<TransportRecoverySnapshot>>,
     transport_auto_rearm_generation: Arc<AtomicU64>,
     transport_rearm_scheduled: Arc<StdMutex<HashSet<u64>>>,
+    virtual_desktop_retry_scheduled: Arc<StdMutex<HashSet<u64>>>,
     usb_reconnect_pending: Arc<AtomicBool>,
     status: Arc<StdMutex<AdbMonitorSnapshot>>,
     operation: Arc<Mutex<()>>,
@@ -642,6 +647,37 @@ impl AdbHealthMonitor {
         Some(next_generation)
     }
 
+    fn rearm_failed_transport_from_authenticated_control(
+        &self,
+    ) -> Option<(u64, u64, TransportRecoveryTrigger)> {
+        if self.stopping.load(Ordering::Acquire) {
+            return None;
+        }
+        let rearmed = if let Ok(mut recovery) = self.transport_recovery.lock() {
+            if recovery.state != TransportRecoveryState::Failed {
+                return None;
+            }
+            let previous_generation = recovery.generation;
+            let trigger = recovery.trigger?;
+            recovery.generation = recovery.generation.wrapping_add(1);
+            recovery.attempt = 1;
+            recovery.state = TransportRecoveryState::AwaitingControl;
+            (previous_generation, recovery.generation, trigger)
+        } else {
+            return None;
+        };
+        self.transport_auto_rearm_generation
+            .store(0, Ordering::Release);
+        self.update_status(
+            true,
+            true,
+            true,
+            Some("transport_recovery_authenticated_rearm".into()),
+        );
+        self.changed.notify_one();
+        Some(rearmed)
+    }
+
     fn schedule_transport_recovery_rearm(
         &self,
         generation: u64,
@@ -784,8 +820,8 @@ impl AdbHealthMonitor {
         generation: u64,
         attempt: u32,
         succeeded: bool,
-    ) -> Option<bool> {
-        let retry = if let Ok(mut recovery) = self.transport_recovery.lock() {
+    ) -> Option<()> {
+        if let Ok(mut recovery) = self.transport_recovery.lock() {
             if recovery.generation != generation
                 || recovery.attempt != attempt
                 || recovery.state != TransportRecoveryState::RestartingVirtualDesktop
@@ -794,25 +830,157 @@ impl AdbHealthMonitor {
             }
             if succeeded {
                 recovery.state = TransportRecoveryState::Recovered;
-                false
-            } else if recovery.attempt < TRANSPORT_RECOVERY_MAX_ATTEMPTS {
-                recovery.state = TransportRecoveryState::Pending;
-                true
             } else {
-                recovery.state = TransportRecoveryState::Failed;
-                false
+                recovery.state = TransportRecoveryState::WaitingForVirtualDesktop;
             }
         } else {
             return None;
-        };
-        self.sync_transport_recovery_status((!succeeded).then(|| {
-            if retry {
-                "transport_recovery_virtual_desktop_retry".into()
-            } else {
-                "transport_recovery_virtual_desktop_failed".into()
+        }
+        self.sync_transport_recovery_status(
+            (!succeeded).then(|| "transport_recovery_waiting_for_virtual_desktop".into()),
+        );
+        Some(())
+    }
+
+    fn finish_virtual_desktop_retry(&self, generation: u64, succeeded: bool) -> bool {
+        if let Ok(mut recovery) = self.transport_recovery.lock() {
+            if recovery.generation != generation
+                || recovery.state != TransportRecoveryState::WaitingForVirtualDesktop
+            {
+                return false;
             }
-        }));
-        Some(retry)
+            if succeeded {
+                recovery.state = TransportRecoveryState::Recovered;
+            }
+        } else {
+            return false;
+        }
+        self.sync_transport_recovery_status(
+            (!succeeded).then(|| "transport_recovery_waiting_for_virtual_desktop".into()),
+        );
+        true
+    }
+
+    fn schedule_virtual_desktop_retry(
+        &self,
+        config: &AdbMonitorConfig,
+        diagnostics: &Diagnostics,
+        generation: u64,
+        trigger: TransportRecoveryTrigger,
+    ) {
+        self.schedule_virtual_desktop_retry_after(
+            config.clone(),
+            diagnostics.clone(),
+            generation,
+            trigger,
+            VIRTUAL_DESKTOP_RETRY_DELAY,
+        );
+    }
+
+    fn schedule_virtual_desktop_retry_after(
+        &self,
+        config: AdbMonitorConfig,
+        diagnostics: Diagnostics,
+        generation: u64,
+        trigger: TransportRecoveryTrigger,
+        delay: Duration,
+    ) {
+        let scheduled = self
+            .virtual_desktop_retry_scheduled
+            .lock()
+            .is_ok_and(|mut scheduled| scheduled.insert(generation));
+        if !scheduled {
+            return;
+        }
+        let _ = diagnostics.record(
+            "transport_recovery_virtual_desktop_retry_scheduled",
+            json!({
+                "generation": generation,
+                "trigger": trigger,
+                "delay_ms": delay.as_millis().min(u64::MAX as u128) as u64,
+            }),
+        );
+        let monitor = self.clone();
+        tokio::spawn(async move {
+            time::sleep(delay).await;
+            if let Ok(mut scheduled) = monitor.virtual_desktop_retry_scheduled.lock() {
+                scheduled.remove(&generation);
+            }
+            let recovery = monitor.transport_recovery_snapshot();
+            if monitor.stopping.load(Ordering::Acquire)
+                || recovery.generation != generation
+                || recovery.state != TransportRecoveryState::WaitingForVirtualDesktop
+            {
+                return;
+            }
+
+            let _operation = monitor.operation.lock().await;
+            let recovery = monitor.transport_recovery_snapshot();
+            if monitor.stopping.load(Ordering::Acquire)
+                || recovery.generation != generation
+                || recovery.state != TransportRecoveryState::WaitingForVirtualDesktop
+            {
+                return;
+            }
+
+            let result = if config.virtual_desktop_flows.snapshot().connected {
+                wait_for_virtual_desktop_connection(
+                    &config.virtual_desktop_flows,
+                    &monitor,
+                    generation,
+                    VIRTUAL_DESKTOP_CONNECTION_TIMEOUT,
+                )
+                .await
+            } else {
+                let recovery_adb = config.adb.clone();
+                match task::spawn_blocking(move || recovery_adb.restart_virtual_desktop()).await {
+                    Ok(Ok(())) => {
+                        wait_for_virtual_desktop_connection(
+                            &config.virtual_desktop_flows,
+                            &monitor,
+                            generation,
+                            VIRTUAL_DESKTOP_CONNECTION_TIMEOUT,
+                        )
+                        .await
+                    }
+                    Ok(Err(_)) => Err("virtual_desktop_restart"),
+                    Err(_) => Err("virtual_desktop_restart_task"),
+                }
+            };
+
+            match result {
+                Ok(()) => {
+                    if monitor.finish_virtual_desktop_retry(generation, true) {
+                        let _ = diagnostics.record(
+                            "transport_recovery_completed",
+                            json!({
+                                "generation": generation,
+                                "trigger": trigger,
+                                "strategy": "virtual_desktop_only",
+                            }),
+                        );
+                    }
+                }
+                Err(category) => {
+                    if monitor.finish_virtual_desktop_retry(generation, false) {
+                        let _ = diagnostics.record(
+                            "transport_recovery_waiting_for_virtual_desktop",
+                            json!({
+                                "generation": generation,
+                                "trigger": trigger,
+                                "category": category,
+                            }),
+                        );
+                        monitor.schedule_virtual_desktop_retry(
+                            &config,
+                            &diagnostics,
+                            generation,
+                            trigger,
+                        );
+                    }
+                }
+            }
+        });
     }
 
     fn expire_transport_recovery_control(&self, generation: u64, attempt: u32) -> Option<bool> {
@@ -1162,7 +1330,7 @@ impl AdbHealthMonitor {
             return true;
         }
         let mut failure_category = "virtual_desktop_connection_timeout";
-        for relaunch_attempt in 1..=3 {
+        for relaunch_attempt in 1..=VIRTUAL_DESKTOP_FULL_RECOVERY_ATTEMPTS {
             if should_reset_virtual_desktop_service(trigger, relaunch_attempt) {
                 let quiesce_adb = config.adb.clone();
                 let quiesced = task::spawn_blocking(move || {
@@ -1259,28 +1427,22 @@ impl AdbHealthMonitor {
             );
         }
 
-        let retry = self
+        if self
             .finish_virtual_desktop_restart(generation, attempt, false)
-            .unwrap_or(false);
+            .is_none()
+        {
+            return true;
+        }
         let _ = diagnostics.record(
-            "transport_recovery_failed",
+            "transport_recovery_waiting_for_virtual_desktop",
             json!({
                 "generation": generation,
                 "attempt": attempt,
                 "trigger": trigger,
-                "will_retry": retry,
                 "category": failure_category,
             }),
         );
-        if retry {
-            let changed = self.changed.clone();
-            tokio::spawn(async move {
-                time::sleep(TRANSPORT_RECOVERY_RETRY_DELAY).await;
-                changed.notify_one();
-            });
-        } else {
-            self.schedule_transport_recovery_rearm(generation, trigger, diagnostics);
-        }
+        self.schedule_virtual_desktop_retry(config, diagnostics, generation, trigger);
         true
     }
 
@@ -2204,6 +2366,19 @@ impl HostRuntime {
         let observer: StateObserver = Arc::new(move |snapshot| {
             update_relay_gate(&observer_relay_gate, snapshot);
             if snapshot.state == HostState::Connected {
+                if let Some((previous_generation, generation, trigger)) =
+                    observer_adb_monitor.rearm_failed_transport_from_authenticated_control()
+                {
+                    observer_relay_gate.carrier_healthy();
+                    let _ = observer_diagnostics.record(
+                        "transport_recovery_authenticated_rearm",
+                        json!({
+                            "previous_generation": previous_generation,
+                            "generation": generation,
+                            "trigger": trigger,
+                        }),
+                    );
+                }
                 observer_adb_monitor.notify_authenticated_connection();
             } else {
                 observer_adb_monitor.notify_state_change();
@@ -4338,6 +4513,50 @@ mod tests {
         );
     }
 
+    #[test]
+    fn authenticated_control_rearms_terminal_recovery_without_rebuilding_mappings() {
+        let monitor = AdbHealthMonitor::default();
+        let generation = monitor.notify_host_resume();
+        monitor.begin_transport_recovery_attempt().unwrap();
+        assert!(monitor.finish_transport_recovery_attempt(generation, false));
+        monitor.begin_transport_recovery_attempt().unwrap();
+        assert!(!monitor.finish_transport_recovery_attempt(generation, false));
+
+        let fallback_generation = monitor
+            .rearm_failed_transport(generation, TransportRecoveryTrigger::HostResume)
+            .unwrap();
+        monitor.begin_transport_recovery_attempt().unwrap();
+        assert!(monitor.finish_transport_recovery_attempt(fallback_generation, false));
+        monitor.begin_transport_recovery_attempt().unwrap();
+        assert!(!monitor.finish_transport_recovery_attempt(fallback_generation, false));
+
+        let (previous_generation, authenticated_generation, trigger) = monitor
+            .rearm_failed_transport_from_authenticated_control()
+            .unwrap();
+        assert_eq!(previous_generation, fallback_generation);
+        assert_eq!(authenticated_generation, fallback_generation + 1);
+        assert_eq!(trigger, TransportRecoveryTrigger::HostResume);
+        let snapshot = monitor.snapshot();
+        assert!(snapshot.device_available);
+        assert!(snapshot.mappings_healthy);
+        assert_eq!(
+            snapshot.last_error.as_deref(),
+            Some("transport_recovery_authenticated_rearm")
+        );
+        assert_eq!(
+            monitor.begin_virtual_desktop_restart(),
+            Some((
+                authenticated_generation,
+                1,
+                TransportRecoveryTrigger::HostResume,
+            ))
+        );
+        assert_eq!(
+            monitor.rearm_failed_transport_from_authenticated_control(),
+            None
+        );
+    }
+
     #[tokio::test]
     async fn terminal_recovery_scheduler_rearms_once_after_its_delay() {
         let directory = tempfile::tempdir().unwrap();
@@ -4393,10 +4612,87 @@ mod tests {
             TransportRecoveryTrigger::UsbReconnect,
             1,
         ));
-        assert!(should_reset_virtual_desktop_service(
+        assert!(!should_reset_virtual_desktop_service(
             TransportRecoveryTrigger::UsbReconnect,
             2,
         ));
+    }
+
+    #[tokio::test]
+    async fn virtual_desktop_wait_preserves_transport_and_deduplicates_app_retry() {
+        let directory = tempfile::tempdir().unwrap();
+        let paths = AppPaths::discover(Some(directory.path().to_owned())).unwrap();
+        let diagnostics = Diagnostics::open(&paths.logs).unwrap();
+        let executor = Arc::new(MonitorMockAdb::default());
+        let config = AdbMonitorConfig {
+            adb: AdbController::new(executor.clone()),
+            adb_program: PathBuf::new(),
+            session_id: SessionId([0x74; 16]),
+            all_traffic: false,
+            virtual_desktop_flows: VirtualDesktopFlowMonitor::default(),
+        };
+        let monitor = AdbHealthMonitor::default();
+        let generation = monitor.notify_host_resume();
+        assert_eq!(
+            monitor.begin_transport_recovery_attempt(),
+            Some((generation, 1, TransportRecoveryTrigger::HostResume))
+        );
+        assert!(!monitor.finish_transport_recovery_attempt(generation, true));
+        monitor.update_status(true, true, true, None);
+        assert_eq!(
+            monitor.begin_virtual_desktop_restart(),
+            Some((generation, 1, TransportRecoveryTrigger::HostResume))
+        );
+        assert_eq!(
+            monitor.finish_virtual_desktop_restart(generation, 1, false),
+            Some(())
+        );
+
+        let waiting = monitor.snapshot();
+        assert_eq!(
+            waiting.transport_recovery.state,
+            TransportRecoveryState::WaitingForVirtualDesktop
+        );
+        assert!(waiting.mappings_healthy);
+        assert!(!monitor.transport_requires_recovery());
+
+        for _ in 0..2 {
+            monitor.schedule_virtual_desktop_retry_after(
+                config.clone(),
+                diagnostics.clone(),
+                generation,
+                TransportRecoveryTrigger::HostResume,
+                Duration::from_millis(10),
+            );
+        }
+        time::timeout(Duration::from_secs(2), async {
+            while monitor.snapshot().transport_recovery.state != TransportRecoveryState::Recovered {
+                time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("Virtual Desktop-only retry did not complete");
+
+        assert!(monitor.snapshot().mappings_healthy);
+        assert!(monitor
+            .virtual_desktop_retry_scheduled
+            .lock()
+            .unwrap()
+            .is_empty());
+        let calls = executor.calls.lock().unwrap();
+        assert_eq!(
+            calls
+                .iter()
+                .filter(|arguments| {
+                    arguments.iter().any(|argument| argument == "start")
+                        && arguments.iter().any(|argument| argument == "-n")
+                })
+                .count(),
+            1
+        );
+        assert!(!calls
+            .iter()
+            .any(|arguments| { arguments.iter().any(|argument| argument == "--remove") }));
     }
 
     #[tokio::test]

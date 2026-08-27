@@ -959,7 +959,6 @@ impl AdbController {
             "shell".into(),
             "am".into(),
             "start".into(),
-            "-W".into(),
             "-n".into(),
             component,
         ])?;
@@ -1874,6 +1873,7 @@ mod tests {
         assert!(calls[3]
             .windows(2)
             .any(|arguments| arguments == ["-n", component]));
+        assert!(!calls[3].iter().any(|argument| argument == "-W"));
     }
 
     #[test]
