@@ -18,6 +18,8 @@ use std::sync::atomic::{AtomicBool, AtomicU8, AtomicUsize};
 
 use anyhow::{bail, Context, Result};
 use clap::{Args, Parser, Subcommand};
+#[cfg(not(target_os = "windows"))]
+use gnirehtet_vd::runtime::OperationGuard;
 use gnirehtet_vd::{
     adb::{
         repair_adb_if_missing, resolve_adb_program, AdbController, SystemAdb,
@@ -28,7 +30,7 @@ use gnirehtet_vd::{
     protocol::SessionId,
     runtime::{
         admin_command, doctor, process_is_running, read_daemon_pid, terminate_daemon,
-        AdminResponse, AppPaths, HostRuntime, OperationGuard, RuntimeConfig, StateStore,
+        AdminResponse, AppPaths, HostRuntime, RuntimeConfig, StateStore,
     },
     state::{HostState, StateSnapshot},
 };
@@ -862,14 +864,38 @@ async fn run_foreground(
     Ok(())
 }
 
+struct LifecycleOperationGuard {
+    #[cfg(not(target_os = "windows"))]
+    _file: OperationGuard,
+}
+
+fn acquire_lifecycle_operation(paths: &AppPaths) -> Result<LifecycleOperationGuard> {
+    #[cfg(target_os = "windows")]
+    {
+        // The per-user broker gate and tray coordinator serialize every public
+        // Start, Stop, and Repair command on Windows. Keeping a second
+        // filesystem sentinel here makes antivirus rollback able to strand a
+        // delete-pending filename and permanently block an otherwise healthy
+        // broker.
+        let _ = paths;
+        Ok(LifecycleOperationGuard {})
+    }
+    #[cfg(not(target_os = "windows"))]
+    {
+        Ok(LifecycleOperationGuard {
+            _file: OperationGuard::acquire(&paths.operation_lock)
+                .context("another start/stop/repair operation is active")?,
+        })
+    }
+}
+
 async fn start(
     daemon_adb: &std::path::Path,
     paths: &AppPaths,
     adb: &AdbController,
     args: StartArgs,
 ) -> Result<String> {
-    let _operation = OperationGuard::acquire(&paths.operation_lock)
-        .context("another start/stop/repair operation is active")?;
+    let _operation = acquire_lifecycle_operation(paths)?;
     if let Some(pid) = read_daemon_pid(&paths.daemon_pid).filter(|pid| process_is_running(*pid)) {
         bail!("host daemon is already running as PID {pid}");
     }
@@ -934,8 +960,7 @@ async fn start(
 }
 
 async fn stop(paths: &AppPaths, adb: &AdbController) -> Result<String> {
-    let _operation = OperationGuard::acquire(&paths.operation_lock)
-        .context("another start/stop/repair operation is active")?;
+    let _operation = acquire_lifecycle_operation(paths)?;
     // The health monitor uses sub-second mapping commands and checks the Stop
     // flag between them. This envelope still covers one in-flight monitor
     // command plus the six-second peer acknowledgement deadline.
@@ -1144,8 +1169,7 @@ fn reflect_missing_runtime(snapshot: &mut StateSnapshot) {
 }
 
 fn repair(paths: &AppPaths, adb: &AdbController) -> Result<String> {
-    let _operation = OperationGuard::acquire(&paths.operation_lock)
-        .context("another start/stop/repair operation is active")?;
+    let _operation = acquire_lifecycle_operation(paths)?;
     if read_daemon_pid(&paths.daemon_pid).is_some() || runtime_may_be_active(paths) {
         bail!("host daemon is active; its serialized ADB monitor owns mapping repair");
     }
