@@ -30,6 +30,7 @@ pub const SOCKS_ATYP_DOMAIN: u8 = 0x03;
 pub const SOCKS_ATYP_IPV6: u8 = 0x04;
 pub const MAX_UDP_PAYLOAD: usize = 65_507;
 pub const MAX_DOMAIN_LEN: usize = 255;
+pub const VIRTUAL_DESKTOP_STREAMER_PORTS: [u16; 4] = [38_810, 38_820, 38_830, 38_840];
 pub const DEFAULT_ASSOCIATION_BYTE_BUDGET: usize = 256 * 1024;
 pub const DEFAULT_GLOBAL_QUEUE_BYTE_BUDGET: usize = 8 * 1024 * 1024;
 const MAX_WRITE_BATCH_BYTES: usize = u8::MAX as usize + MAX_UDP_PAYLOAD;

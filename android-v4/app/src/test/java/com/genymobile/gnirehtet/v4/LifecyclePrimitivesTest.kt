@@ -97,6 +97,22 @@ class LifecyclePrimitivesTest {
         assertFalse(canFinishRejectedStart(hasActiveResources = false, teardownInProgress = true))
     }
 
+    @Test
+    fun transportEngineResetIsRequiredOncePerConfirmedLoss() {
+        val reset = TransportEngineReset()
+
+        assertFalse(reset.isRequired())
+        assertTrue(reset.require())
+        assertFalse(reset.require())
+        assertTrue(reset.isRequired())
+        assertFalse(reset.awaitReady(1))
+        assertTrue(reset.complete())
+        assertFalse(reset.complete())
+        assertFalse(reset.isRequired())
+        assertTrue(reset.awaitReady(1))
+        assertTrue(reset.require())
+    }
+
     companion object {
         private const val WAITER_COUNT = 200
     }

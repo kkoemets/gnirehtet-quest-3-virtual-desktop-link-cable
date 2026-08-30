@@ -366,8 +366,6 @@ pub struct AdbHealthMonitor {
 struct AdbMonitorConfig {
     adb: AdbController,
     adb_program: PathBuf,
-    session_id: SessionId,
-    all_traffic: bool,
 }
 
 #[derive(Clone, Copy)]
@@ -375,6 +373,7 @@ struct RelayEligibility {
     carrier_healthy: bool,
     control_authenticated: bool,
     control_loss_pending: bool,
+    screen_suspended: bool,
     control_epoch: u64,
 }
 
@@ -397,6 +396,7 @@ impl RelayGateController {
                 carrier_healthy: true,
                 control_authenticated: false,
                 control_loss_pending: false,
+                screen_suspended: false,
                 control_epoch: 0,
             })),
             control_loss_grace,
@@ -408,22 +408,55 @@ impl RelayGateController {
             eligibility.control_epoch = eligibility.control_epoch.wrapping_add(1);
             eligibility.control_loss_pending = false;
             eligibility.control_authenticated = true;
-            self.gate.set_enabled(eligibility.carrier_healthy);
+            eligibility.screen_suspended = false;
+            if eligibility.carrier_healthy {
+                self.gate.set_enabled(true);
+            } else {
+                self.gate.wait_for_activation();
+            }
         }
+    }
+
+    fn screen_suspended(&self) {
+        if let Ok(mut eligibility) = self.eligibility.lock() {
+            eligibility.control_epoch = eligibility.control_epoch.wrapping_add(1);
+            eligibility.control_loss_pending = false;
+            eligibility.control_authenticated = false;
+            eligibility.screen_suspended = true;
+            self.gate.invalidate_and_wait_for_activation();
+        }
+    }
+
+    fn screen_suspended_if_epoch(&self, epoch: u64) -> bool {
+        if let Ok(mut eligibility) = self.eligibility.lock() {
+            if eligibility.control_epoch != epoch || !eligibility.control_authenticated {
+                return false;
+            }
+            eligibility.control_epoch = eligibility.control_epoch.wrapping_add(1);
+            eligibility.control_loss_pending = false;
+            eligibility.control_authenticated = false;
+            eligibility.screen_suspended = true;
+            self.gate.invalidate_and_wait_for_activation();
+            return true;
+        }
+        false
     }
 
     fn authenticated_wake(&self) {
         if let Ok(mut eligibility) = self.eligibility.lock() {
             eligibility.control_epoch = eligibility.control_epoch.wrapping_add(1);
             eligibility.control_loss_pending = false;
-            eligibility.control_authenticated = false;
-            self.gate.set_enabled(false);
+            eligibility.screen_suspended = false;
+            self.gate.wait_for_activation();
         }
     }
 
     fn control_degraded(&self) {
         let epoch = if let Ok(mut eligibility) = self.eligibility.lock() {
-            if !eligibility.control_authenticated || eligibility.control_loss_pending {
+            if !eligibility.control_authenticated
+                || eligibility.control_loss_pending
+                || eligibility.screen_suspended
+            {
                 return;
             }
             eligibility.control_epoch = eligibility.control_epoch.wrapping_add(1);
@@ -452,7 +485,10 @@ impl RelayGateController {
 
     fn control_inactive_if_epoch(&self, epoch: u64) -> bool {
         if let Ok(mut eligibility) = self.eligibility.lock() {
-            if eligibility.control_epoch != epoch || !eligibility.control_authenticated {
+            if eligibility.control_epoch != epoch
+                || !eligibility.control_authenticated
+                || eligibility.screen_suspended
+            {
                 return false;
             }
             eligibility.control_epoch = eligibility.control_epoch.wrapping_add(1);
@@ -469,7 +505,18 @@ impl RelayGateController {
             eligibility.control_epoch = eligibility.control_epoch.wrapping_add(1);
             eligibility.control_loss_pending = false;
             eligibility.control_authenticated = false;
+            eligibility.screen_suspended = false;
             self.gate.set_enabled(false);
+        }
+    }
+
+    fn control_inactive_awaiting_recovery(&self) {
+        if let Ok(mut eligibility) = self.eligibility.lock() {
+            eligibility.control_epoch = eligibility.control_epoch.wrapping_add(1);
+            eligibility.control_loss_pending = false;
+            eligibility.control_authenticated = false;
+            eligibility.screen_suspended = false;
+            self.gate.invalidate_and_wait_for_activation();
         }
     }
 
@@ -479,14 +526,33 @@ impl RelayGateController {
             eligibility.control_loss_pending = false;
             eligibility.carrier_healthy = false;
             eligibility.control_authenticated = false;
+            eligibility.screen_suspended = false;
             self.gate.set_enabled(false);
+        }
+    }
+
+    fn carrier_lost_awaiting_recovery(&self) {
+        if let Ok(mut eligibility) = self.eligibility.lock() {
+            eligibility.control_epoch = eligibility.control_epoch.wrapping_add(1);
+            eligibility.control_loss_pending = false;
+            eligibility.carrier_healthy = false;
+            eligibility.control_authenticated = false;
+            eligibility.screen_suspended = false;
+            self.gate.invalidate_and_wait_for_activation();
         }
     }
 
     fn carrier_healthy(&self) {
         if let Ok(mut eligibility) = self.eligibility.lock() {
             eligibility.carrier_healthy = true;
-            self.gate.set_enabled(eligibility.control_authenticated);
+            if eligibility.screen_suspended {
+                return;
+            }
+            if eligibility.control_authenticated {
+                self.gate.set_enabled(true);
+            } else {
+                self.gate.wait_for_activation();
+            }
         }
     }
 }
@@ -875,8 +941,15 @@ impl AdbHealthMonitor {
             let mut child = match spawn_track_devices(&config.adb_program) {
                 Ok(child) => child,
                 Err(_) => {
-                    self.track_failed(adb, &control, &store, &diagnostics, "track_spawn_failed")
-                        .await;
+                    self.track_failed(
+                        adb,
+                        &control,
+                        &store,
+                        &diagnostics,
+                        &relay_gate,
+                        "track_spawn_failed",
+                    )
+                    .await;
                     if sleep_or_stop(&self, backoff).await {
                         return;
                     }
@@ -891,6 +964,7 @@ impl AdbHealthMonitor {
                     &control,
                     &store,
                     &diagnostics,
+                    &relay_gate,
                     "track_stdout_unavailable",
                 )
                 .await;
@@ -1062,7 +1136,7 @@ impl AdbHealthMonitor {
                 return;
             }
             if let Some(category) = tracker_failed {
-                self.track_failed(adb, &control, &store, &diagnostics, category)
+                self.track_failed(adb, &control, &store, &diagnostics, &relay_gate, category)
                     .await;
                 if sleep_or_stop(&self, backoff).await {
                     return;
@@ -1096,11 +1170,11 @@ impl AdbHealthMonitor {
         if !self.transport_requires_recovery() {
             return false;
         }
-        relay_gate.carrier_lost();
         if self.stopping.load(Ordering::Acquire) {
             return true;
         }
         if !device_available {
+            relay_gate.carrier_lost_awaiting_recovery();
             self.wait_for_recovery_device();
             self.update_status(
                 true,
@@ -1114,6 +1188,7 @@ impl AdbHealthMonitor {
         else {
             return true;
         };
+        relay_gate.carrier_lost_awaiting_recovery();
         self.update_status(
             true,
             true,
@@ -1134,25 +1209,11 @@ impl AdbHealthMonitor {
             return true;
         }
         let recovery_adb = config.adb.clone();
-        let session_id = config.session_id;
-        let all_traffic = config.all_traffic;
-        let restart_android = trigger == TransportRecoveryTrigger::UsbReconnect && attempt > 1;
-        let strategy = if restart_android {
-            "android_restart"
-        } else {
-            "mapping_reinstall"
-        };
+        let strategy = "mapping_reinstall";
         let result = task::spawn_blocking(move || -> Result<(), &'static str> {
-            if restart_android {
-                recovery_adb
-                    .start(session_id, all_traffic)
-                    .map(|_| ())
-                    .map_err(|_| "android_restart")?;
-            } else {
-                recovery_adb
-                    .reinstall_mappings()
-                    .map_err(|_| "mapping_rebuild")?;
-            }
+            recovery_adb
+                .reinstall_mappings()
+                .map_err(|_| "mapping_rebuild")?;
             Ok(())
         })
         .await;
@@ -1164,7 +1225,7 @@ impl AdbHealthMonitor {
                 // A control connection can race mapping recreation. Cancel it
                 // after the fresh listeners are installed so only a HELLO from
                 // this recovery generation can reopen the relay.
-                relay_gate.control_inactive();
+                relay_gate.control_inactive_awaiting_recovery();
                 let snapshot = control.reset_transport(TRANSPORT_RECOVERY_REASON).await;
                 let _ = store.write(&snapshot, Some(std::process::id()));
                 let reconnect_generation = self
@@ -1187,11 +1248,13 @@ impl AdbHealthMonitor {
                 );
                 let monitor = self.clone();
                 let diagnostics = diagnostics.clone();
+                let timeout_relay_gate = relay_gate.clone();
                 tokio::spawn(async move {
                     time::sleep(TRANSPORT_RECOVERY_CONTROL_TIMEOUT).await;
                     if let Some(will_retry) =
                         monitor.expire_transport_recovery_control(recovery_generation, attempt)
                     {
+                        timeout_relay_gate.carrier_lost();
                         let _ = diagnostics.record(
                             "transport_recovery_control_timeout",
                             json!({
@@ -1212,6 +1275,7 @@ impl AdbHealthMonitor {
                 });
             }
             Ok(Err(failure_category)) => {
+                relay_gate.carrier_lost();
                 let retry = self.finish_transport_recovery_attempt(recovery_generation, false);
                 self.update_status(
                     true,
@@ -1248,6 +1312,7 @@ impl AdbHealthMonitor {
                 }
             }
             Err(_) => {
+                relay_gate.carrier_lost();
                 let retry = self.finish_transport_recovery_attempt(recovery_generation, false);
                 self.update_status(
                     true,
@@ -1306,7 +1371,7 @@ impl AdbHealthMonitor {
             if lifecycle_active {
                 self.note_usb_disconnected();
             }
-            relay_gate.carrier_lost();
+            relay_gate.carrier_lost_awaiting_recovery();
             if lifecycle_active {
                 self.record_loss(control, store, diagnostics, false, "device_unavailable")
                     .await;
@@ -1424,7 +1489,7 @@ impl AdbHealthMonitor {
             Ok(Ok(status))
                 if status.screen_suspended == Some(true)
                     && status.state.as_deref() == Some("degraded")
-        ) && relay_gate.control_inactive_if_epoch(control_epoch)
+        ) && relay_gate.screen_suspended_if_epoch(control_epoch)
         {
             let _ = diagnostics.record("android_sleep_confirmed", json!({}));
         }
@@ -1436,6 +1501,7 @@ impl AdbHealthMonitor {
         control: &ControlHandle,
         store: &StateStore,
         diagnostics: &Diagnostics,
+        relay_gate: &RelayGateController,
         category: &'static str,
     ) {
         if category == "track_decode_failed" {
@@ -1460,6 +1526,7 @@ impl AdbHealthMonitor {
             }
         }
         self.update_status(false, false, false, Some(category.into()));
+        relay_gate.carrier_lost_awaiting_recovery();
         if matches!(
             control.snapshot().await.state,
             HostState::Connected | HostState::Degraded
@@ -1845,6 +1912,7 @@ impl HostRuntime {
             std::process::id(),
         )?;
         let relay_gate = RelayGate::default();
+        relay_gate.wait_for_activation();
         let relay_gate_controller = RelayGateController::new(relay_gate.clone());
         let adb_monitor = AdbHealthMonitor::default();
         let observer_store = store.clone();
@@ -1880,7 +1948,7 @@ impl HostRuntime {
         });
         let suspend_relay_gate = relay_gate_controller.clone();
         let suspend_observer: SuspendObserver = Arc::new(move || {
-            suspend_relay_gate.control_inactive();
+            suspend_relay_gate.screen_suspended();
         });
         let wake_relay_gate = relay_gate_controller.clone();
         let wake_adb_monitor = adb_monitor.clone();
@@ -2028,8 +2096,6 @@ impl HostRuntime {
             AdbMonitorConfig {
                 adb: self.config.adb.clone(),
                 adb_program: self.config.adb_program.clone(),
-                session_id: self.config.session_id,
-                all_traffic: self.config.all_traffic,
             },
             control_handle.clone(),
             store.clone(),
@@ -2108,7 +2174,7 @@ fn update_relay_gate(relay_gate: &RelayGateController, snapshot: &StateSnapshot)
     match snapshot.state {
         HostState::Connected => relay_gate.control_connected(),
         HostState::Degraded if snapshot.reason.as_deref() == Some(TRANSPORT_RECOVERY_REASON) => {
-            relay_gate.carrier_lost();
+            relay_gate.carrier_lost_awaiting_recovery();
         }
         HostState::Degraded
             if snapshot.reason.as_deref() == Some(CONTROL_TRANSPORT_LOST_REASON) =>
@@ -3699,7 +3765,7 @@ mod tests {
     }
 
     #[test]
-    fn authenticated_wake_rotates_stale_flows_before_immediate_reenable() {
+    fn authenticated_sleep_closes_flows_until_wake_control_returns() {
         let relay_gate = RelayGate::default();
         let relay_controller = RelayGateController::new(relay_gate.clone());
 
@@ -3707,14 +3773,68 @@ mod tests {
         let connected_generation = relay_gate.generation();
         assert!(relay_gate.is_enabled());
 
+        relay_controller.screen_suspended();
+        assert!(!relay_gate.is_enabled());
+        assert!(relay_gate.is_awaiting_activation());
+        assert_eq!(relay_gate.generation(), connected_generation + 1);
+
+        relay_controller.carrier_healthy();
+        assert!(!relay_gate.is_enabled());
+        assert!(relay_gate.is_awaiting_activation());
+
         relay_controller.authenticated_wake();
         assert!(!relay_gate.is_enabled());
-        assert!(relay_gate.generation() > connected_generation);
-        let suspended_generation = relay_gate.generation();
+        assert!(relay_gate.is_awaiting_activation());
 
         relay_controller.control_connected();
         assert!(relay_gate.is_enabled());
-        assert!(relay_gate.generation() > suspended_generation);
+        assert!(!relay_gate.is_awaiting_activation());
+        assert_eq!(relay_gate.generation(), connected_generation + 2);
+    }
+
+    #[tokio::test]
+    async fn carrier_loss_during_sleep_stays_closed_until_carrier_and_control_recover() {
+        let relay_gate = RelayGate::default();
+        let relay_controller = RelayGateController::new(relay_gate.clone());
+
+        relay_controller.control_connected();
+        relay_controller.screen_suspended();
+        relay_controller.carrier_lost();
+        let lost_generation = relay_gate.generation();
+        assert!(!relay_gate.is_enabled());
+
+        relay_controller.authenticated_wake();
+        relay_controller.control_connected();
+        assert!(!relay_gate.is_enabled());
+        assert!(relay_gate.is_awaiting_activation());
+        assert_eq!(relay_gate.generation(), lost_generation + 1);
+
+        relay_controller.carrier_healthy();
+        assert!(relay_gate.is_enabled());
+    }
+
+    #[test]
+    fn recovery_wait_survives_repeated_absence_and_control_reset() {
+        let relay_gate = RelayGate::default();
+        let relay_controller = RelayGateController::new(relay_gate.clone());
+
+        relay_controller.control_connected();
+        relay_controller.carrier_lost_awaiting_recovery();
+        let waiting_generation = relay_gate.generation();
+        assert!(relay_gate.is_awaiting_activation());
+
+        relay_controller.carrier_lost_awaiting_recovery();
+        relay_controller.control_inactive_awaiting_recovery();
+        relay_controller.carrier_healthy();
+        assert!(relay_gate.is_awaiting_activation());
+        assert_eq!(relay_gate.generation(), waiting_generation);
+
+        relay_controller.control_connected();
+        assert!(relay_gate.is_enabled());
+
+        relay_controller.carrier_lost();
+        assert!(!relay_gate.is_awaiting_activation());
+        assert!(!relay_gate.is_enabled());
     }
 
     #[test]
@@ -3911,8 +4031,6 @@ mod tests {
         let config = AdbMonitorConfig {
             adb: AdbController::new(executor.clone()),
             adb_program: PathBuf::new(),
-            session_id: session,
-            all_traffic: true,
         };
         let monitor = AdbHealthMonitor::default();
         let relay_gate = RelayGate::default();
@@ -3972,7 +4090,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn usb_reconnect_preserves_android_and_virtual_desktop_processes() {
+    async fn usb_reconnect_preserves_helper_and_virtual_desktop_on_every_attempt() {
         let directory = tempfile::tempdir().unwrap();
         let paths = AppPaths::discover(Some(directory.path().to_owned())).unwrap();
         let diagnostics = Diagnostics::open(&paths.logs).unwrap();
@@ -3996,8 +4114,6 @@ mod tests {
         let config = AdbMonitorConfig {
             adb: AdbController::new(executor.clone()),
             adb_program: PathBuf::new(),
-            session_id: session,
-            all_traffic: false,
         };
         let monitor = AdbHealthMonitor::default();
         let relay_gate = RelayGate::default();
@@ -4029,6 +4145,20 @@ mod tests {
             TransportRecoveryState::AwaitingControl
         );
         assert!(!relay_gate.is_enabled());
+
+        assert_eq!(monitor.expire_transport_recovery_control(1, 1), Some(true));
+        assert!(
+            monitor
+                .recover_transport(
+                    &config,
+                    &control.command_handle(),
+                    &store,
+                    &diagnostics,
+                    &relay_controller,
+                    true,
+                )
+                .await
+        );
         {
             let calls = executor.calls.lock().unwrap();
             assert!(!calls.iter().any(|args| args
@@ -4043,7 +4173,7 @@ mod tests {
                     .iter()
                     .filter(|args| args.iter().any(|argument| argument == "--remove"))
                     .count(),
-                REVERSE_MAPPINGS.len()
+                REVERSE_MAPPINGS.len() * 2
             );
             assert_eq!(
                 calls
@@ -4054,7 +4184,7 @@ mod tests {
                             && !args.iter().any(|argument| argument == "--remove")
                     })
                     .count(),
-                REVERSE_MAPPINGS.len()
+                REVERSE_MAPPINGS.len() * 2
             );
         }
 
@@ -4271,7 +4401,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn confirmed_android_sleep_closes_flows_when_control_is_degraded() {
+    async fn confirmed_android_sleep_closes_flows_immediately() {
         let directory = tempfile::tempdir().unwrap();
         let paths = AppPaths::discover(Some(directory.path().to_owned())).unwrap();
         let diagnostics = Diagnostics::open(&paths.logs).unwrap();
@@ -4300,8 +4430,12 @@ mod tests {
         let adb = AdbController::new(executor.clone());
         let monitor = AdbHealthMonitor::default();
         let relay_gate = RelayGate::default();
-        let relay_controller = RelayGateController::new(relay_gate.clone());
+        let relay_controller = RelayGateController::with_control_loss_grace(
+            relay_gate.clone(),
+            Duration::from_millis(30),
+        );
         relay_controller.control_connected();
+        let connected_generation = relay_gate.generation();
         relay_controller.control_degraded();
 
         monitor
@@ -4316,16 +4450,9 @@ mod tests {
             .await;
 
         assert!(!relay_gate.is_enabled());
-        monitor
-            .reconcile(
-                &adb,
-                &control.command_handle(),
-                &store,
-                &diagnostics,
-                &relay_controller,
-                true,
-            )
-            .await;
+        assert!(relay_gate.is_awaiting_activation());
+        assert_eq!(relay_gate.generation(), connected_generation + 1);
+        assert_eq!(relay_controller.pending_control_epoch(), None);
         assert_eq!(
             executor
                 .calls
@@ -4682,7 +4809,8 @@ mod tests {
         let monitor = AdbHealthMonitor::default();
         let adb = AdbController::new(Arc::new(MonitorMockAdb::default()));
         let relay_gate = RelayGate::default();
-        relay_gate.set_enabled(true);
+        let relay_controller = RelayGateController::new(relay_gate.clone());
+        relay_controller.control_connected();
         let connected_generation = relay_gate.generation();
         monitor.update_status(true, true, true, None);
         monitor
@@ -4691,6 +4819,7 @@ mod tests {
                 &control.command_handle(),
                 &store,
                 &diagnostics,
+                &relay_controller,
                 "track_decode_failed",
             )
             .await;
@@ -4726,6 +4855,9 @@ mod tests {
         let mock = Arc::new(MonitorMockAdb::default());
         mock.device_available.store(false, Ordering::Relaxed);
         let adb = AdbController::new(mock);
+        let relay_gate = RelayGate::default();
+        let relay_controller = RelayGateController::new(relay_gate.clone());
+        relay_controller.control_connected();
         monitor.update_status(true, true, true, None);
         monitor
             .track_failed(
@@ -4733,6 +4865,7 @@ mod tests {
                 &control.command_handle(),
                 &store,
                 &diagnostics,
+                &relay_controller,
                 "track_decode_failed",
             )
             .await;
@@ -4741,6 +4874,8 @@ mod tests {
         assert!(!snapshot.active);
         assert!(!snapshot.device_available);
         assert!(!snapshot.mappings_healthy);
+        assert!(!relay_gate.is_enabled());
+        assert!(relay_gate.is_awaiting_activation());
         assert_eq!(control.state().lock().await.state(), HostState::Degraded);
         assert!(monitor.usb_reconnect_pending.load(Ordering::Acquire));
     }
@@ -4765,6 +4900,10 @@ mod tests {
             .unwrap();
         let monitor = AdbHealthMonitor::default();
         let adb = AdbController::new(Arc::new(MonitorMockAdb::default()));
+        let relay_gate = RelayGate::default();
+        let relay_controller = RelayGateController::new(relay_gate.clone());
+        relay_controller.control_connected();
+        relay_controller.screen_suspended();
         monitor.update_status(true, true, true, None);
         monitor
             .track_failed(
@@ -4772,6 +4911,7 @@ mod tests {
                 &control.command_handle(),
                 &store,
                 &diagnostics,
+                &relay_controller,
                 "track_read_failed",
             )
             .await;
@@ -4780,6 +4920,8 @@ mod tests {
         assert!(!snapshot.active);
         assert!(!snapshot.device_available);
         assert!(!snapshot.mappings_healthy);
+        assert!(!relay_gate.is_enabled());
+        assert!(relay_gate.is_awaiting_activation());
         assert_eq!(control.state().lock().await.state(), HostState::Degraded);
         assert!(monitor.usb_reconnect_pending.load(Ordering::Acquire));
     }

@@ -30,14 +30,23 @@
 
         <activity
             android:name=".AdbControlActivity"
+            android:exported="false"
+            android:theme="@style/TransparentTheme" />
+
+        <service
+            android:name=".AdbControlService"
+            android:enabled="true"
             android:exported="true"
-            android:permission="android.permission.WRITE_SECURE_SETTINGS"
-            android:theme="@style/TransparentTheme">
+            android:foregroundServiceType="specialUse"
+            android:permission="android.permission.WRITE_SECURE_SETTINGS">
             <intent-filter>
                 <action android:name="com.genymobile.gnirehtet.v4.START" />
                 <action android:name="com.genymobile.gnirehtet.v4.STOP" />
             </intent-filter>
-        </activity>
+            <property
+                android:name="android.app.PROPERTY_SPECIAL_USE_FGS_SUBTYPE"
+                android:value="Short-lived ADB control dispatch for the wired VPN" />
+        </service>
 
         <receiver
             android:name=".StatusReceiver"

@@ -19,12 +19,13 @@ class AdbControlActivity : Activity() {
                 finish()
             }
             ACTION_START -> requestNotificationAndVpnPermission(intent)
+            ACTION_PREPARE -> requestNotificationAndVpnPermission(null)
             else -> finish()
         }
     }
 
-    private fun requestNotificationAndVpnPermission(source: Intent) {
-        pendingStart = Intent(source)
+    private fun requestNotificationAndVpnPermission(source: Intent?) {
+        pendingStart = source?.let(::Intent)
         if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU &&
             checkSelfPermission(Manifest.permission.POST_NOTIFICATIONS) != PackageManager.PERMISSION_GRANTED
         ) {
@@ -38,6 +39,7 @@ class AdbControlActivity : Activity() {
         val permission = VpnService.prepare(this)
         if (permission == null) {
             pendingStart?.let { VdLinkVpnService.start(this, it) }
+            clearManualConsentError()
             pendingStart = null
             finish()
         } else {
@@ -53,14 +55,7 @@ class AdbControlActivity : Activity() {
     ) {
         super.onRequestPermissionsResult(requestCode, permissions, grantResults)
         if (requestCode != NOTIFICATION_PERMISSION_REQUEST) return
-        if (grantResults.firstOrNull() == PackageManager.PERMISSION_GRANTED) {
-            requestVpnPermission()
-        } else {
-            VdLinkVpnService.lastError.set("Notification permission is required for manual wired-link recovery")
-            VdLinkVpnService.state.set(LifecycleState.ERROR)
-            pendingStart = null
-            finish()
-        }
+        requestVpnPermission()
     }
 
     @Deprecated("VpnService permission still uses the activity result contract")
@@ -68,14 +63,22 @@ class AdbControlActivity : Activity() {
         super.onActivityResult(requestCode, resultCode, data)
         if (requestCode == VPN_PERMISSION_REQUEST && resultCode == RESULT_OK) {
             pendingStart?.let { VdLinkVpnService.start(this, it) }
+            clearManualConsentError()
         }
         pendingStart = null
         finish()
     }
 
+    private fun clearManualConsentError() {
+        if (VdLinkVpnService.lastError.compareAndSet(AdbControlService.MANUAL_VPN_CONSENT_ERROR, null)) {
+            VdLinkVpnService.state.compareAndSet(LifecycleState.ERROR, LifecycleState.STOPPED)
+        }
+    }
+
     companion object {
         const val ACTION_START = "com.genymobile.gnirehtet.v4.START"
         const val ACTION_STOP = "com.genymobile.gnirehtet.v4.STOP"
+        const val ACTION_PREPARE = "com.genymobile.gnirehtet.v4.PREPARE"
         private const val VPN_PERMISSION_REQUEST = 42
         private const val NOTIFICATION_PERMISSION_REQUEST = 43
     }

@@ -1,5 +1,8 @@
 <resources>
     <string name="app_name">Quest VD Wired</string>
     <string name="status_title">Wired Virtual Desktop link</string>
+    <string name="control_channel_name">Wired link control</string>
+    <string name="control_notification_title">Applying wired link command</string>
+    <string name="grant_vpn_permission">Grant VPN permission</string>
     <string name="stop_link">Stop wired link</string>
 </resources>

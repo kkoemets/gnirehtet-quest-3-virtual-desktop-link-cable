@@ -25,6 +25,83 @@ class ControlSupervisorTest {
     }
 
     @Test
+    fun initialConnectionFailureDoesNotReportTransportLoss() {
+        val unavailable = ServerSocket().apply {
+            bind(InetSocketAddress(InetAddress.getByName("127.0.0.1"), 0))
+        }
+        val port = unavailable.localPort
+        unavailable.close()
+        val degraded = CountDownLatch(1)
+        val transportLosses = AtomicInteger()
+        val supervisor = ControlSupervisor(
+            UUID.randomUUID(),
+            port,
+            object : ControlSupervisor.Listener {
+                override fun shouldReportStarted(): Boolean = true
+                override fun onControlConnected() = Unit
+                override fun onControlDegraded(error: Exception?) = degraded.countDown()
+                override fun onControlTransportLost(error: Exception?) {
+                    transportLosses.incrementAndGet()
+                }
+                override fun onControlRttSample(rttNanos: Long) = Unit
+                override fun onControlStopRequested(sendStopped: () -> Unit) = Unit
+            },
+        )
+
+        supervisor.start()
+        assertTrue(degraded.await(2, TimeUnit.SECONDS))
+        supervisor.close()
+        assertEquals(0, transportLosses.get())
+    }
+
+    @Test
+    fun authenticatedConnectionReportsOneTransportLoss() {
+        val session = UUID.fromString("10203040-5060-7080-90a0-b0c0d0e0f000")
+        val server = ServerSocket().apply {
+            bind(InetSocketAddress(InetAddress.getByName("127.0.0.1"), 0))
+        }
+        val executor = Executors.newSingleThreadExecutor()
+        val exchange = executor.submit {
+            server.use {
+                it.accept().use { connection ->
+                    assertEquals(Gnr4MessageType.HELLO, Gnr4.read(connection.getInputStream(), session).type)
+                    Gnr4.write(
+                        connection.getOutputStream(),
+                        Gnr4Frame(Gnr4MessageType.HELLO_ACK, session),
+                    )
+                    assertEquals(Gnr4MessageType.STARTED, Gnr4.read(connection.getInputStream(), session).type)
+                }
+            }
+        }
+        val connected = CountDownLatch(1)
+        val transportLost = CountDownLatch(1)
+        val transportLosses = AtomicInteger()
+        val supervisor = ControlSupervisor(
+            session,
+            server.localPort,
+            object : ControlSupervisor.Listener {
+                override fun shouldReportStarted(): Boolean = true
+                override fun onControlConnected() = connected.countDown()
+                override fun onControlDegraded(error: Exception?) = Unit
+                override fun onControlTransportLost(error: Exception?) {
+                    transportLosses.incrementAndGet()
+                    transportLost.countDown()
+                }
+                override fun onControlRttSample(rttNanos: Long) = Unit
+                override fun onControlStopRequested(sendStopped: () -> Unit) = Unit
+            },
+        )
+
+        supervisor.start()
+        assertTrue(connected.await(2, TimeUnit.SECONDS))
+        exchange.get(2, TimeUnit.SECONDS)
+        assertTrue(transportLost.await(2, TimeUnit.SECONDS))
+        supervisor.close()
+        executor.shutdownNow()
+        assertEquals(1, transportLosses.get())
+    }
+
+    @Test
     fun usesIpv4LoopbackAndAcknowledgesStop() {
         val session = UUID.fromString("00112233-4455-6677-8899-aabbccddeeff")
         val server = ServerSocket().apply {

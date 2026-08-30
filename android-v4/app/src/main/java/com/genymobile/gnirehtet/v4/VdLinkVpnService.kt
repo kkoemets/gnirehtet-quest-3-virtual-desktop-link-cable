@@ -28,9 +28,11 @@ import java.io.FileDescriptor
 import java.io.IOException
 import java.io.PrintWriter
 import java.util.UUID
+import java.util.concurrent.CountDownLatch
 import java.util.concurrent.ExecutorService
 import java.util.concurrent.Executors
 import java.util.concurrent.ThreadFactory
+import java.util.concurrent.TimeUnit
 import java.util.concurrent.atomic.AtomicBoolean
 import java.util.concurrent.atomic.AtomicInteger
 import java.util.concurrent.atomic.AtomicLong
@@ -73,6 +75,31 @@ internal fun shouldDeferDisplaySuspension(
     wakeDebounceUntilMs: Long,
 ): Boolean = suspended && nowElapsedRealtimeMs < wakeDebounceUntilMs
 
+internal class TransportEngineReset {
+    private val pending = AtomicReference<CountDownLatch?>()
+
+    fun require(): Boolean = pending.compareAndSet(null, CountDownLatch(1))
+
+    fun isRequired(): Boolean = pending.get() != null
+
+    fun awaitReady(timeoutMs: Long): Boolean {
+        val completion = pending.get() ?: return true
+        return try {
+            completion.await(timeoutMs, TimeUnit.MILLISECONDS)
+        } catch (_: InterruptedException) {
+            Thread.currentThread().interrupt()
+            false
+        }
+    }
+
+    fun complete(): Boolean {
+        val completion = pending.get() ?: return false
+        if (!pending.compareAndSet(completion, null)) return false
+        completion.countDown()
+        return true
+    }
+}
+
 class VdLinkVpnService : VpnService() {
     private data class SessionResources(
         val generation: Long,
@@ -82,6 +109,7 @@ class VdLinkVpnService : VpnService() {
         val engineStartLock: Any = Any(),
         val engineSuspended: AtomicBoolean = AtomicBoolean(),
         val engineResumeQueued: AtomicBoolean = AtomicBoolean(),
+        val transportEngineReset: TransportEngineReset = TransportEngineReset(),
         @Volatile var control: ControlSupervisor? = null,
     )
 
@@ -293,7 +321,11 @@ class VdLinkVpnService : VpnService() {
                 resources.parameters.sessionId,
                 resources.parameters.controlPort,
                 object : ControlSupervisor.Listener {
-                    override fun shouldReportStarted(): Boolean = isCurrent(resources, supervisor)
+                    override fun shouldReportStarted(): Boolean =
+                        isCurrent(resources, supervisor) &&
+                            !screenSuspended.get() &&
+                            resources.transportEngineReset.awaitReady(ENGINE_START_TIMEOUT_MS.toLong()) &&
+                            !resources.engineSuspended.get()
 
                     override fun onControlConnected() {
                         onControlReady(resources, supervisor)
@@ -305,6 +337,10 @@ class VdLinkVpnService : VpnService() {
                             lastError.set(error?.message)
                             updateNotification()
                         }
+                    }
+
+                    override fun onControlTransportLost(error: Exception?) {
+                        onControlTransportLost(resources, supervisor)
                     }
 
                     override fun onControlRttSample(rttNanos: Long) {
@@ -368,31 +404,62 @@ class VdLinkVpnService : VpnService() {
     }
 
     private fun setScreenSuspended(suspended: Boolean) {
-        if (!screenSuspended.compareAndSet(!suspended, suspended)) return
-        val resources = synchronized(lifecycleLock) { active }
-        val control = resources?.control
-        if (suspended) {
-            resources?.engineSuspended?.set(true)
-            control?.suspend()
-            if (resources != null) worker.execute { suspendNativeEngine(resources) }
-            if (control != null && state.compareAndSet(LifecycleState.CONNECTED, LifecycleState.DEGRADED)) {
-                lastError.set("Headset is asleep; VPN remains ready to reconnect")
-                updateNotification()
+        var resourcesToSuspend: SessionResources? = null
+        synchronized(lifecycleLock) {
+            if (!screenSuspended.compareAndSet(!suspended, suspended)) return
+            val resources = active
+            val control = resources?.control
+            if (suspended) {
+                resources?.engineSuspended?.set(true)
+                control?.suspend()
+                resourcesToSuspend = resources
+                if (control != null && state.compareAndSet(LifecycleState.CONNECTED, LifecycleState.DEGRADED)) {
+                    lastError.set("Headset is asleep; VPN remains ready to reconnect")
+                    updateNotification()
+                }
+            } else if (resources?.engineSuspended?.get() == true) {
+                queueNativeEngineResume(resources)
+            } else {
+                control?.resume()
             }
-        } else {
-            control?.resume()
         }
+        resourcesToSuspend?.let { worker.execute { suspendNativeEngine(it) } }
     }
 
     private fun onControlReady(resources: SessionResources, supervisor: ControlSupervisor) {
-        if (!isCurrent(resources, supervisor) || screenSuspended.get()) return
-        if (resources.engineSuspended.get()) {
-            queueNativeEngineResume(resources, supervisor)
+        if (
+            !isCurrent(resources, supervisor) ||
+            screenSuspended.get() ||
+            !supervisor.isRecoveryReady()
+        ) return
+        if (resources.transportEngineReset.isRequired()) {
+            resources.engineSuspended.set(true)
+            queueNativeEngineResume(resources)
             return
         }
         state.set(LifecycleState.CONNECTED)
         lastError.set(null)
         updateNotification()
+    }
+
+    private fun onControlTransportLost(
+        resources: SessionResources,
+        supervisor: ControlSupervisor,
+    ) {
+        val resetEngine = synchronized(lifecycleLock) {
+            if (
+                !generationGate.isCurrent(resources.generation) ||
+                active !== resources ||
+                resources.control !== supervisor ||
+                !resources.transportEngineReset.require()
+            ) {
+                false
+            } else {
+                resources.engineSuspended.set(true)
+                !screenSuspended.get()
+            }
+        }
+        if (resetEngine) queueNativeEngineResume(resources)
     }
 
     private fun suspendNativeEngine(resources: SessionResources) {
@@ -405,17 +472,16 @@ class VdLinkVpnService : VpnService() {
         }
     }
 
-    private fun queueNativeEngineResume(
-        resources: SessionResources,
-        supervisor: ControlSupervisor,
-    ) {
+    private fun queueNativeEngineResume(resources: SessionResources) {
         if (!resources.engineResumeQueued.compareAndSet(false, true)) return
         worker.execute {
             var retry = false
+            var completedTransportReset = false
+            var supervisor: ControlSupervisor? = null
             try {
                 synchronized(resources.engineStartLock) {
                     if (
-                        !isCurrent(resources, supervisor) ||
+                        !isCurrent(resources) ||
                         screenSuspended.get() ||
                         !resources.engineSuspended.get()
                     ) return@execute
@@ -430,15 +496,23 @@ class VdLinkVpnService : VpnService() {
                         MTU,
                     )
                     resources.tunnel.awaitReady(ENGINE_START_TIMEOUT_MS)
-                    resources.engineSuspended.set(false)
                 }
-                if (isCurrent(resources, supervisor) && !screenSuspended.get()) {
-                    state.set(LifecycleState.CONNECTED)
-                    lastError.set(null)
-                    updateNotification()
+                synchronized(lifecycleLock) {
+                    if (
+                        !generationGate.isCurrent(resources.generation) ||
+                        active !== resources ||
+                        screenSuspended.get()
+                    ) return@synchronized
+                    resources.engineSuspended.set(false)
+                    completedTransportReset = resources.transportEngineReset.complete()
+                    supervisor = resources.control
+                    resources.control?.resume()
+                }
+                if (completedTransportReset) {
+                    supervisor?.let { onControlReady(resources, it) }
                 }
             } catch (error: Throwable) {
-                retry = isCurrent(resources, supervisor) && !screenSuspended.get()
+                retry = isCurrent(resources) && !screenSuspended.get()
                 Log.w(TAG, "Native engine wake restart failed", error)
                 if (retry) {
                     state.set(LifecycleState.DEGRADED)
@@ -447,9 +521,13 @@ class VdLinkVpnService : VpnService() {
                 }
             } finally {
                 resources.engineResumeQueued.set(false)
-                if (retry) {
+                if (
+                    (retry || resources.engineSuspended.get()) &&
+                    isCurrent(resources) &&
+                    !screenSuspended.get()
+                ) {
                     mainHandler.postDelayed(
-                        { queueNativeEngineResume(resources, supervisor) },
+                        { queueNativeEngineResume(resources) },
                         ENGINE_RESTART_RETRY_MS,
                     )
                 }
