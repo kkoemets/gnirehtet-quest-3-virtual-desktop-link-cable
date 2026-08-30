@@ -963,9 +963,15 @@ impl AdbController {
                 ANDROID_VPN_SERVICE,
             ]))?;
             let normalized = output.stdout.to_ascii_lowercase();
+            let process_stopped = normalized.contains("pid=(not running)")
+                && !normalized
+                    .lines()
+                    .map(str::trim)
+                    .any(|line| line == "vpnfdopen=true");
             let service_absent = normalized.trim().is_empty()
                 || normalized.contains("no services match")
-                || normalized.contains("no service records found");
+                || normalized.contains("no service records found")
+                || process_stopped;
             if service_absent || vpn_descriptor_explicitly_closed(&output.stdout) {
                 return Ok(());
             }
@@ -1673,6 +1679,28 @@ mod tests {
         ))]));
         let result = controller(mock).finish_control_stop();
         assert!(result.is_err());
+    }
+
+    #[test]
+    fn stopped_android_service_process_is_a_closed_vpn() {
+        let mock = Arc::new(MockAdb::with_results(vec![
+            Ok(AdbOutput::success(format!(
+                "SERVICE {ANDROID_VPN_SERVICE} 31534bb pid=(not running)"
+            ))),
+            Ok(AdbOutput::success("")),
+            Ok(AdbOutput::success("")),
+            Ok(AdbOutput::success("")),
+            Ok(AdbOutput::success("")),
+        ]));
+        controller(mock).finish_control_stop().unwrap();
+    }
+
+    #[test]
+    fn stopped_android_process_does_not_override_an_open_vpn_descriptor() {
+        let mock = Arc::new(MockAdb::with_results(vec![Ok(AdbOutput::success(
+            format!("SERVICE {ANDROID_VPN_SERVICE} 31534bb pid=(not running)\nvpnFdOpen=true"),
+        ))]));
+        assert!(controller(mock).finish_control_stop().is_err());
     }
 
     #[test]
