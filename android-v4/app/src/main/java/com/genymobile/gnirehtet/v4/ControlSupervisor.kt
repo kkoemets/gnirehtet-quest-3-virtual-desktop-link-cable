@@ -36,6 +36,8 @@ class ControlSupervisor(
 
         fun onControlDegraded(error: Exception?)
 
+        fun onControlTransportLost(error: Exception?) = Unit
+
         fun onControlRttSample(rttNanos: Long)
 
         fun onControlStopRequested(sendStopped: () -> Unit)
@@ -48,6 +50,7 @@ class ControlSupervisor(
     private val pauseLock = Object()
     private val suspendAcknowledgement = AtomicReference<CountDownLatch?>()
     private val controlReady = AtomicBoolean()
+    private val recoveryReady = AtomicBoolean()
     private val stopRequested = AtomicBoolean()
     private val wakePending = AtomicBoolean()
     private val resetReconnectDelay = AtomicBoolean()
@@ -152,8 +155,9 @@ class ControlSupervisor(
                         throw IllegalStateException("Expected HELLO_ACK, got ${acknowledgement.type}")
                     }
                     val metricsEnabled = Gnr4.helloAckSupportsMetrics(acknowledgement.payload)
+                    if (!listener.shouldReportStarted()) return@use
                     synchronized(pauseLock) {
-                        if (!isActiveSocket(connected) || !listener.shouldReportStarted()) return@use
+                        if (!isActiveSocket(connected)) return@use
                         val wake = wakePending.get()
                         write(
                             connected,
@@ -167,6 +171,7 @@ class ControlSupervisor(
                         if (wake) {
                             connected.soTimeout = WAKE_CONFIRM_TIMEOUT_MS
                         } else {
+                            recoveryReady.set(true)
                             listener.onControlConnected()
                         }
                     }
@@ -198,6 +203,7 @@ class ControlSupervisor(
                                     if (!paused.get() && wakePending.compareAndSet(true, false)) {
                                         resetReconnectDelay.set(false)
                                         connected.soTimeout = CONTROL_READ_TIMEOUT_MS
+                                        recoveryReady.set(true)
                                         listener.onControlConnected()
                                     }
                                 }
@@ -253,9 +259,14 @@ class ControlSupervisor(
                     }
                 }
             } catch (error: Exception) {
+                val lostRecoveryReadyTransport = recoveryReady.getAndSet(false)
+                controlReady.set(false)
                 if (running.get() && !paused.get()) {
                     Log.w(TAG, "Control lane degraded", error)
                     listener.onControlDegraded(error)
+                    if (lostRecoveryReadyTransport) {
+                        listener.onControlTransportLost(error)
+                    }
                     val retryDelayMs =
                         if (wakePending.get()) WAKE_RECONNECT_DELAY_MS else delayMs
                     waitForReconnect(retryDelayMs)
@@ -263,6 +274,7 @@ class ControlSupervisor(
                 }
             } finally {
                 controlReady.set(false)
+                recoveryReady.set(false)
                 suspendAcknowledgement.getAndSet(null)?.countDown()
                 synchronized(pauseLock) {
                     socket = null
@@ -276,6 +288,7 @@ class ControlSupervisor(
             if (!running.compareAndSet(true, false)) return
             paused.set(false)
             controlReady.set(false)
+            recoveryReady.set(false)
             suspendAcknowledgement.getAndSet(null)?.countDown()
             socket?.close()
             pauseLock.notifyAll()
@@ -289,6 +302,8 @@ class ControlSupervisor(
 
     private fun isActiveSocket(connected: Socket): Boolean =
         running.get() && !paused.get() && socket === connected && !connected.isClosed
+
+    fun isRecoveryReady(): Boolean = recoveryReady.get()
 
     private fun awaitResume(): Boolean {
         synchronized(pauseLock) {

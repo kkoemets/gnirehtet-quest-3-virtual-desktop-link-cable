@@ -3,7 +3,7 @@ use std::{
     net::{Ipv4Addr, SocketAddr},
     pin::Pin,
     sync::{
-        atomic::{AtomicU64, AtomicUsize, Ordering},
+        atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering},
         Arc, Mutex as StdMutex,
     },
     task::{Context, Poll},
@@ -15,7 +15,7 @@ use serde_json::json;
 use thiserror::Error;
 use tokio::{
     io::{self, AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt},
-    net::{TcpListener, TcpSocket, TcpStream, UdpSocket as TokioUdpSocket},
+    net::{TcpListener, TcpStream},
     sync::{watch, Semaphore},
     time,
 };
@@ -24,7 +24,7 @@ use crate::{
     diagnostics::Diagnostics,
     udp::{
         decode_endpoint, encode_endpoint, relay_fwd_udp, Endpoint, FwdUdpConfig, HevFrameError,
-        UdpStats,
+        UdpStats, VIRTUAL_DESKTOP_STREAMER_PORTS,
     },
 };
 
@@ -33,11 +33,10 @@ pub const AUTH_NONE: u8 = 0x00;
 pub const AUTH_UNACCEPTABLE: u8 = 0xff;
 pub const CMD_CONNECT: u8 = 0x01;
 pub const CMD_FWD_UDP: u8 = 0x05;
-const VIRTUAL_DESKTOP_STREAMER_PORTS: [u16; 4] = [38_810, 38_820, 38_830, 38_840];
-
 #[derive(Clone, Default)]
 pub struct VirtualDesktopFlowMonitor {
     active: Arc<[AtomicUsize; VIRTUAL_DESKTOP_STREAMER_PORTS.len()]>,
+    forwarding: Arc<[AtomicUsize; VIRTUAL_DESKTOP_STREAMER_PORTS.len()]>,
 }
 
 impl VirtualDesktopFlowMonitor {
@@ -49,13 +48,16 @@ impl VirtualDesktopFlowMonitor {
         Some(VirtualDesktopFlowGuard {
             monitor: self.clone(),
             index,
+            forwarded: AtomicBool::new(false),
         })
     }
 
     pub fn snapshot(&self) -> VirtualDesktopFlowSnapshot {
         let active_flows = std::array::from_fn(|index| self.active[index].load(Ordering::Relaxed));
+        let forwarding_flows: [usize; VIRTUAL_DESKTOP_STREAMER_PORTS.len()] =
+            std::array::from_fn(|index| self.forwarding[index].load(Ordering::Relaxed));
         VirtualDesktopFlowSnapshot {
-            connected: active_flows.iter().all(|count| *count > 0),
+            connected: forwarding_flows.iter().all(|count| *count > 0),
             active_ports: active_flows.iter().filter(|count| **count > 0).count(),
             active_flows,
         }
@@ -65,10 +67,22 @@ impl VirtualDesktopFlowMonitor {
 struct VirtualDesktopFlowGuard {
     monitor: VirtualDesktopFlowMonitor,
     index: usize,
+    forwarded: AtomicBool,
+}
+
+impl VirtualDesktopFlowGuard {
+    fn mark_forwarded(&self) {
+        if !self.forwarded.swap(true, Ordering::AcqRel) {
+            self.monitor.forwarding[self.index].fetch_add(1, Ordering::Relaxed);
+        }
+    }
 }
 
 impl Drop for VirtualDesktopFlowGuard {
     fn drop(&mut self) {
+        if self.forwarded.load(Ordering::Acquire) {
+            self.monitor.forwarding[self.index].fetch_sub(1, Ordering::Relaxed);
+        }
         self.monitor.active[self.index].fetch_sub(1, Ordering::Relaxed);
     }
 }
@@ -142,14 +156,21 @@ struct ObservedIo<'a, T> {
     inner: T,
     endpoint: FlowEndpoint,
     observation: &'a FlowObservation,
+    virtual_desktop_flow: Option<&'a VirtualDesktopFlowGuard>,
 }
 
 impl<'a, T> ObservedIo<'a, T> {
-    fn new(inner: T, endpoint: FlowEndpoint, observation: &'a FlowObservation) -> Self {
+    fn new(
+        inner: T,
+        endpoint: FlowEndpoint,
+        observation: &'a FlowObservation,
+        virtual_desktop_flow: Option<&'a VirtualDesktopFlowGuard>,
+    ) -> Self {
         Self {
             inner,
             endpoint,
             observation,
+            virtual_desktop_flow,
         }
     }
 
@@ -196,9 +217,16 @@ where
     ) -> Poll<Result<usize, StdIoError>> {
         let this = self.get_mut();
         let result = Pin::new(&mut this.inner).poll_write(context, buffer);
-        if matches!(result, Poll::Ready(Err(_))) {
-            this.observation
-                .record(this.endpoint, FlowTerminalEvent::WriteError);
+        match result {
+            Poll::Ready(Ok(written)) if written > 0 => {
+                if let Some(flow) = this.virtual_desktop_flow {
+                    flow.mark_forwarded();
+                }
+            }
+            Poll::Ready(Err(_)) => this
+                .observation
+                .record(this.endpoint, FlowTerminalEvent::WriteError),
+            _ => {}
         }
         result
     }
@@ -312,11 +340,12 @@ pub struct SocksServer {
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
 struct RelayGateState {
     enabled: bool,
+    awaiting_activation: bool,
     generation: u64,
 }
 
-/// Invalidates every active relay flow on confirmed suspend or carrier loss,
-/// while keeping the listeners alive for a fresh wake connection.
+/// Invalidates active relay flows when the transport becomes unusable while
+/// keeping the listeners alive for a fresh connection.
 #[derive(Clone, Debug)]
 pub struct RelayGate {
     sender: watch::Sender<RelayGateState>,
@@ -332,10 +361,34 @@ impl Default for RelayGate {
 impl RelayGate {
     pub fn set_enabled(&self, enabled: bool) {
         self.sender.send_if_modified(|state| {
-            if state.enabled == enabled {
+            if state.enabled == enabled && !state.awaiting_activation {
                 return false;
             }
             state.enabled = enabled;
+            state.awaiting_activation = false;
+            state.generation = state.generation.saturating_add(1);
+            true
+        });
+    }
+
+    pub fn wait_for_activation(&self) {
+        self.sender.send_if_modified(|state| {
+            if state.enabled || state.awaiting_activation {
+                return false;
+            }
+            state.awaiting_activation = true;
+            state.generation = state.generation.saturating_add(1);
+            true
+        });
+    }
+
+    pub fn invalidate_and_wait_for_activation(&self) {
+        self.sender.send_if_modified(|state| {
+            if !state.enabled && state.awaiting_activation {
+                return false;
+            }
+            state.enabled = false;
+            state.awaiting_activation = true;
             state.generation = state.generation.saturating_add(1);
             true
         });
@@ -344,6 +397,11 @@ impl RelayGate {
     #[cfg(test)]
     pub(crate) fn is_enabled(&self) -> bool {
         self.sender.borrow().enabled
+    }
+
+    #[cfg(test)]
+    pub(crate) fn is_awaiting_activation(&self) -> bool {
+        self.sender.borrow().awaiting_activation
     }
 
     #[cfg(test)]
@@ -430,6 +488,12 @@ impl SocksServer {
                     Some(generation) => Some((gate.clone(), generation)),
                     None => {
                         self.stats.rejected.fetch_add(1, Ordering::Relaxed);
+                        if let Some(diagnostics) = &self.diagnostics {
+                            let _ = diagnostics.record(
+                                "socks_connection_error",
+                                json!({"category": "relay_inactive"}),
+                            );
+                        }
                         continue;
                     }
                 },
@@ -439,6 +503,10 @@ impl SocksServer {
                 Ok(permit) => permit,
                 Err(_) => {
                     self.stats.rejected.fetch_add(1, Ordering::Relaxed);
+                    if let Some(diagnostics) = &self.diagnostics {
+                        let _ = diagnostics
+                            .record("socks_connection_error", json!({"category": "capacity"}));
+                    }
                     continue;
                 }
             };
@@ -449,11 +517,11 @@ impl SocksServer {
                 let result = match relay_lease {
                     Some((gate, generation)) => {
                         tokio::select! {
-                            result = server.handle(stream) => result,
+                            result = server.handle(stream, Some(generation)) => result,
                             _ = gate.wait_for_invalidation(generation) => Err(SocksError::RelayInactive),
                         }
                     }
-                    None => server.handle(stream).await,
+                    None => server.handle(stream, None).await,
                 };
                 server.stats.active.fetch_sub(1, Ordering::Relaxed);
                 drop(permit);
@@ -467,7 +535,11 @@ impl SocksServer {
         }
     }
 
-    async fn handle(&self, mut client: TcpStream) -> Result<(), SocksError> {
+    async fn handle(
+        &self,
+        mut client: TcpStream,
+        _relay_generation: Option<u64>,
+    ) -> Result<(), SocksError> {
         let handshake = time::timeout(self.config.handshake_timeout, async {
             negotiate_auth(&mut client).await?;
             read_request(&mut client).await
@@ -539,22 +611,11 @@ impl SocksServer {
         let vd_streamer_flow = VIRTUAL_DESKTOP_STREAMER_PORTS.contains(&destination_port);
         let flow_started = time::Instant::now();
         let upstream = time::timeout(self.config.connect_timeout, async {
-            let target = destination.resolve().await?;
-            let canonical_local_target = VIRTUAL_DESKTOP_STREAMER_PORTS.contains(&destination_port)
-                && socket_address_is_local(target);
-            let connect_target = if canonical_local_target {
-                primary_routed_ipv4_target(target.port()).await?
-            } else {
-                target
-            };
-            let redirected_local_target = connect_target.ip() != target.ip();
-            let upstream = TcpStream::connect(connect_target)
-                .await
-                .map_err(crate::udp::UdpRelayError::from)?;
-            Ok::<_, crate::udp::UdpRelayError>((upstream, redirected_local_target))
+            let resolved_target = destination.resolve().await?;
+            Ok::<_, SocksError>(TcpStream::connect(resolved_target).await?)
         })
         .await;
-        let (upstream, redirected_local_target) = match upstream {
+        let upstream = match upstream {
             Ok(Ok(stream)) => stream,
             Ok(Err(error)) => {
                 let _ = write_reply(
@@ -563,7 +624,7 @@ impl SocksServer {
                     Endpoint::Socket(SocketAddr::new(Ipv4Addr::UNSPECIFIED.into(), 0)),
                 )
                 .await;
-                return Err(error.into());
+                return Err(error);
             }
             Err(_) => {
                 let _ = write_reply(
@@ -575,19 +636,11 @@ impl SocksServer {
                 return Err(SocksError::ConnectTimeout);
             }
         };
-        if redirected_local_target {
-            if let Some(diagnostics) = &self.diagnostics {
-                let _ = diagnostics.record(
-                    "vd_streamer_local_target_canonicalized",
-                    json!({"destination_port": destination_port}),
-                );
-            }
-        }
         client.set_nodelay(true)?;
         upstream.set_nodelay(true)?;
         let bound = upstream.local_addr()?;
         write_reply(&mut client, 0, Endpoint::Socket(bound)).await?;
-        let _virtual_desktop_flow = self.virtual_desktop_flows.begin(destination_port);
+        let virtual_desktop_flow = self.virtual_desktop_flows.begin(destination_port);
         if vd_streamer_flow {
             if let Some(diagnostics) = &self.diagnostics {
                 let _ = diagnostics.record(
@@ -597,8 +650,18 @@ impl SocksServer {
             }
         }
         let flow_observation = FlowObservation::default();
-        let mut client = ObservedIo::new(client, FlowEndpoint::Quest, &flow_observation);
-        let mut upstream = ObservedIo::new(upstream, FlowEndpoint::Streamer, &flow_observation);
+        let mut client = ObservedIo::new(
+            client,
+            FlowEndpoint::Quest,
+            &flow_observation,
+            virtual_desktop_flow.as_ref(),
+        );
+        let mut upstream = ObservedIo::new(
+            upstream,
+            FlowEndpoint::Streamer,
+            &flow_observation,
+            virtual_desktop_flow.as_ref(),
+        );
         let transfer = io::copy_bidirectional(&mut client, &mut upstream).await;
         if vd_streamer_flow {
             if let Some(diagnostics) = &self.diagnostics {
@@ -647,35 +710,6 @@ fn endpoint_port(endpoint: &Endpoint) -> u16 {
     match endpoint {
         Endpoint::Socket(address) => address.port(),
         Endpoint::Domain(_, port) => *port,
-    }
-}
-
-fn socket_address_is_local(mut target: SocketAddr) -> bool {
-    target.set_port(0);
-    let socket = match target {
-        SocketAddr::V4(_) => TcpSocket::new_v4(),
-        SocketAddr::V6(_) => TcpSocket::new_v6(),
-    };
-    socket.and_then(|socket| socket.bind(target)).is_ok()
-}
-
-async fn primary_routed_ipv4_target(
-    destination_port: u16,
-) -> Result<SocketAddr, crate::udp::UdpRelayError> {
-    let probe = TokioUdpSocket::bind(SocketAddr::new(Ipv4Addr::UNSPECIFIED.into(), 0)).await?;
-    probe
-        .connect(SocketAddr::new(Ipv4Addr::new(192, 0, 2, 1).into(), 9))
-        .await?;
-    let local = probe.local_addr()?;
-    match local.ip() {
-        std::net::IpAddr::V4(address) if !address.is_unspecified() && !address.is_loopback() => {
-            Ok(SocketAddr::new(address.into(), destination_port))
-        }
-        _ => Err(std::io::Error::new(
-            std::io::ErrorKind::AddrNotAvailable,
-            "primary routed IPv4 address is unavailable",
-        )
-        .into()),
     }
 }
 
@@ -871,13 +905,55 @@ mod tests {
         );
     }
 
+    #[tokio::test]
+    async fn duplicate_local_vd_candidates_connect_to_the_exact_requested_target() {
+        let mut upstream = None;
+        for port in VIRTUAL_DESKTOP_STREAMER_PORTS {
+            if let Ok(listener) = TcpListener::bind((Ipv4Addr::LOCALHOST, port)).await {
+                upstream = Some(listener);
+                break;
+            }
+        }
+        let upstream = upstream.expect("no Virtual Desktop test port was available");
+        let destination = upstream.local_addr().unwrap();
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = SocksServer::new(SocksConfig {
+            bind: address,
+            ..Default::default()
+        })
+        .unwrap();
+        let task = tokio::spawn(server.serve_on(listener));
+
+        let _client_a = connect_through_socks(address, destination).await;
+        let _client_b = connect_through_socks(address, destination).await;
+        for _ in 0..2 {
+            let accepted = time::timeout(Duration::from_millis(100), upstream.accept())
+                .await
+                .expect("exact requested target was not connected")
+                .unwrap();
+            assert_eq!(accepted.1.ip(), Ipv4Addr::LOCALHOST);
+        }
+
+        task.abort();
+    }
+
     #[test]
-    fn virtual_desktop_health_requires_all_four_live_ports() {
+    fn virtual_desktop_health_requires_forwarding_on_all_four_live_ports() {
         let monitor = VirtualDesktopFlowMonitor::default();
         let mut guards = Vec::new();
         for port in VIRTUAL_DESKTOP_STREAMER_PORTS {
             guards.push(monitor.begin(port).unwrap());
         }
+        assert_eq!(monitor.snapshot().active_ports, 4);
+        assert!(!monitor.snapshot().connected);
+
+        for guard in &guards[..3] {
+            guard.mark_forwarded();
+        }
+        assert!(!monitor.snapshot().connected);
+
+        guards[3].mark_forwarded();
         assert_eq!(
             monitor.snapshot(),
             VirtualDesktopFlowSnapshot {
@@ -887,22 +963,18 @@ mod tests {
             }
         );
 
-        guards.pop();
-        assert_eq!(monitor.snapshot().active_ports, 3);
+        let duplicate = monitor.begin(VIRTUAL_DESKTOP_STREAMER_PORTS[3]).unwrap();
+        drop(guards.pop());
+        assert_eq!(monitor.snapshot().active_ports, 4);
         assert!(!monitor.snapshot().connected);
-    }
-
-    #[test]
-    fn local_address_detection_requires_a_bindable_address() {
-        assert!(socket_address_is_local("127.0.0.1:38810".parse().unwrap()));
-        assert!(!socket_address_is_local("192.0.2.1:38810".parse().unwrap()));
+        drop(duplicate);
     }
 
     #[tokio::test]
     async fn flow_observation_records_the_endpoint_that_closes_first() {
         let (quest_peer, quest_relay) = io::duplex(64);
         let observation = FlowObservation::default();
-        let mut observed = ObservedIo::new(quest_relay, FlowEndpoint::Quest, &observation);
+        let mut observed = ObservedIo::new(quest_relay, FlowEndpoint::Quest, &observation, None);
 
         drop(quest_peer);
         let mut byte = [0; 1];
@@ -914,6 +986,31 @@ mod tests {
                 event: FlowTerminalEvent::ReadEof,
             })
         );
+    }
+
+    #[tokio::test]
+    async fn forwarded_payload_marks_the_live_virtual_desktop_flow() {
+        let monitor = VirtualDesktopFlowMonitor::default();
+        let mut guards: Vec<_> = VIRTUAL_DESKTOP_STREAMER_PORTS
+            .iter()
+            .map(|port| monitor.begin(*port).unwrap())
+            .collect();
+        for guard in &guards[..3] {
+            guard.mark_forwarded();
+        }
+
+        let (_peer, relay) = io::duplex(64);
+        let observation = FlowObservation::default();
+        let mut observed =
+            ObservedIo::new(relay, FlowEndpoint::Quest, &observation, Some(&guards[3]));
+        assert!(!monitor.snapshot().connected);
+
+        observed.write_all(b"payload").await.unwrap();
+        assert!(monitor.snapshot().connected);
+
+        drop(observed);
+        drop(guards.pop());
+        assert!(!monitor.snapshot().connected);
     }
 
     async fn connect_through_socks(address: SocketAddr, destination: SocketAddr) -> TcpStream {
@@ -1019,7 +1116,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn explicit_suspend_closes_old_tcp_flows_and_reopens_the_same_listener() {
+    async fn gate_disable_closes_old_tcp_flows_and_reopens_the_same_listener() {
         let echo = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let echo_address = echo.local_addr().unwrap();
         let echo_task = tokio::spawn(async move {
@@ -1086,7 +1183,51 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn explicit_suspend_closes_udp_flow_and_wake_accepts_a_fresh_one() {
+    async fn recovery_state_rejects_new_connections_promptly() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let gate = RelayGate::default();
+        gate.wait_for_activation();
+        let server = SocksServer::new(SocksConfig {
+            bind: address,
+            ..Default::default()
+        })
+        .unwrap()
+        .with_relay_gate(gate.clone());
+        let stats = server.clone();
+        let task = tokio::spawn(server.serve_on(listener));
+
+        let mut client = TcpStream::connect(address).await.unwrap();
+        client.write_all(&[5, 1, 0]).await.unwrap();
+        let mut auth = [0; 2];
+        let rejected_read = time::timeout(Duration::from_millis(200), client.read_exact(&mut auth))
+            .await
+            .expect("inactive relay left a new connection pending");
+        assert!(rejected_read.is_err());
+        assert_eq!(stats.stats().accepted_connections, 0);
+        assert_eq!(stats.stats().rejected_connections, 1);
+
+        task.abort();
+    }
+
+    #[test]
+    fn recovery_transition_invalidates_without_an_inactive_gap() {
+        let gate = RelayGate::default();
+        gate.set_enabled(true);
+        let connected_generation = gate.generation();
+        let mut state = gate.sender.subscribe();
+
+        gate.invalidate_and_wait_for_activation();
+
+        assert!(state.has_changed().unwrap());
+        let recovery = *state.borrow_and_update();
+        assert!(!recovery.enabled);
+        assert!(recovery.awaiting_activation);
+        assert_eq!(recovery.generation, connected_generation + 1);
+    }
+
+    #[tokio::test]
+    async fn gate_disable_closes_udp_flow_and_reenable_accepts_a_fresh_one() {
         let echo = UdpSocket::bind("127.0.0.1:0").await.unwrap();
         let echo_address = echo.local_addr().unwrap();
         let echo_task = tokio::spawn(async move {

@@ -13,6 +13,10 @@ static int installed_connect_timeout;
 static int installed_handshake_timeout;
 static int installed_udp_timeout;
 static int expected_splice_timeout;
+static int expected_connect_port;
+static int connect_calls;
+static int splice_calls;
+static int fail_connect;
 
 static HevConfigServer server = {
     .port = 31416,
@@ -24,6 +28,7 @@ static void
 splice (HevSocks5Session *session)
 {
     assert (HEV_SOCKS5 (session)->timeout == expected_splice_timeout);
+    splice_calls++;
 }
 
 static HevSocks5SessionIface session_iface = {
@@ -89,8 +94,13 @@ hev_socks5_client_connect (HevSocks5Client *client, const char *address,
                            int port)
 {
     assert (strcmp (address, "127.0.0.1") == 0);
-    assert (port == server.port || port == server.udp_port);
+    assert (port == expected_connect_port);
     hev_socks5_set_timeout (HEV_SOCKS5 (client), installed_connect_timeout);
+    connect_calls++;
+    if (fail_connect) {
+        fail_connect = 0;
+        return -1;
+    }
     return 0;
 }
 
@@ -127,6 +137,9 @@ run_session (HevSocks5Type type, int data_timeout)
     HevSocks5Client client = { 0 };
     client.base.base.klass = &object_class;
     client.base.type = type;
+    expected_connect_port = type == HEV_SOCKS5_TYPE_TCP
+        ? server.port
+        : server.udp_port;
     expected_splice_timeout = data_timeout;
     hev_socks5_session_run (HEV_SOCKS5_SESSION (&client));
 }
@@ -141,6 +154,13 @@ main (void)
 
     run_session (HEV_SOCKS5_TYPE_TCP, configured_tcp_data_timeout);
     run_session (HEV_SOCKS5_TYPE_UDP_IN_TCP, configured_udp_data_timeout);
+    assert (connect_calls == 2);
+    assert (splice_calls == 2);
+
+    fail_connect = 1;
+    run_session (HEV_SOCKS5_TYPE_TCP, configured_tcp_data_timeout);
+    assert (connect_calls == 3);
+    assert (splice_calls == 2);
     return 0;
 }
 
