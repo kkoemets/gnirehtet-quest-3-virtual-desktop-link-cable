@@ -721,7 +721,6 @@ impl AdbController {
             "shell".into(),
             "am".into(),
             "start".into(),
-            "-W".into(),
             "-n".into(),
             ANDROID_CONTROL_ACTIVITY.into(),
             "-a".into(),
@@ -752,7 +751,6 @@ impl AdbController {
                 "shell",
                 "am",
                 "start",
-                "-W",
                 "-n",
                 ANDROID_CONTROL_ACTIVITY,
                 "-a",
@@ -793,7 +791,6 @@ impl AdbController {
             "shell",
             "am",
             "start",
-            "-W",
             "-n",
             ANDROID_CONTROL_ACTIVITY,
             "-a",
@@ -1524,6 +1521,7 @@ mod tests {
                 .count(),
             REVERSE_MAPPINGS.len()
         );
+        assert!(!calls.iter().any(|args| args.iter().any(|arg| arg == "-W")));
     }
 
     #[test]
@@ -1579,6 +1577,7 @@ mod tests {
             .unwrap();
         assert_eq!(receipt.allowed_package, VIRTUAL_DESKTOP_PACKAGE);
         let calls = mock.calls.lock().unwrap();
+        assert!(!calls.iter().any(|args| args.iter().any(|arg| arg == "-W")));
         let stop_index = calls
             .iter()
             .position(|args| args.iter().any(|arg| arg == ACTION_STOP_V4))
