@@ -538,8 +538,8 @@ class ReleasePolicyTest(unittest.TestCase):
         ignore = (REPOSITORY / ".gitignore").read_text(encoding="utf-8")
 
         self.assertIn('<h1 align="center">Quest VD Wired</h1>', readme)
-        self.assertIn("Download v4.1.8", readme)
-        self.assertIn("quest-vd-wired-v4.1.8-windows-x64.zip", readme)
+        self.assertIn("Download v4.1.9", readme)
+        self.assertIn("quest-vd-wired-v4.1.9-windows-x64.zip", readme)
         self.assertIn("quest-vd-wired.exe", readme)
         self.assertNotIn("docs/", readme)
         self.assertIn("/docs/", ignore)
@@ -549,7 +549,28 @@ class ReleasePolicyTest(unittest.TestCase):
         self.assertIn('versionCode = 56', android_v4)
         self.assertIn('versionName = "4.1.4"', android_v4)
         self.assertIn('<string name="app_name">Quest VD Wired</string>', android_strings)
-        self.assertIn('version = "4.1.8"', rust_v4)
+        self.assertIn('version = "4.1.9"', rust_v4)
+
+    def test_virtual_desktop_processes_are_not_part_of_transport_recovery(self) -> None:
+        sources = "\n".join(
+            (REPOSITORY / path).read_text(encoding="utf-8")
+            for path in (
+                "host-rust/crates/gnirehtet-vd/src/adb.rs",
+                "host-rust/crates/gnirehtet-vd/src/main.rs",
+                "host-rust/crates/gnirehtet-vd/src/runtime.rs",
+            )
+        )
+        forbidden = (
+            "restart_" + "virtual_desktop",
+            "stop_" + "virtual_desktop",
+            "connect_" + "virtual_desktop_with_recovery",
+            "wait_for_" + "virtual_desktop_connected",
+            "VIRTUAL_DESKTOP_" + "RECOVERY_TASK",
+            "WaitingFor" + "VirtualDesktop",
+            "transport_recovery_waiting_for_" + "virtual_desktop",
+        )
+        for fragment in forbidden:
+            self.assertNotIn(fragment, sources)
 
     def test_windows_executable_uses_the_green_tray_icon(self) -> None:
         crate = (REPOSITORY / "host-rust/crates/gnirehtet-vd/Cargo.toml").read_text(

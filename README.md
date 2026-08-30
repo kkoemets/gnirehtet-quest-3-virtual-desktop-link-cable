@@ -18,7 +18,7 @@
 </p>
 
 <p align="center">
-  <a href="https://github.com/kkoemets/quest-vd-wired/releases/download/v4.1.8/quest-vd-wired-v4.1.8-windows-x64.zip"><strong>Download v4.1.8</strong></a>
+  <a href="https://github.com/kkoemets/quest-vd-wired/releases/download/v4.1.9/quest-vd-wired-v4.1.9-windows-x64.zip"><strong>Download v4.1.9</strong></a>
   · <a href="#quick-start">Setup</a>
   · <a href="#troubleshooting">Troubleshooting</a>
   · <a href="https://github.com/kkoemets/quest-vd-wired/discussions/categories/q-a">Get help</a>
@@ -46,7 +46,7 @@ Quest 2, Quest 3S, and Quest Pro have not been tested.
 
 ## Quick start
 
-1. [Download v4.1.8](https://github.com/kkoemets/quest-vd-wired/releases/download/v4.1.8/quest-vd-wired-v4.1.8-windows-x64.zip) and extract it.
+1. [Download v4.1.9](https://github.com/kkoemets/quest-vd-wired/releases/download/v4.1.9/quest-vd-wired-v4.1.9-windows-x64.zip) and extract it.
 2. Connect and unlock the Quest. Accept **Allow USB debugging**.
 3. Run `quest-vd-wired.exe`.
 4. Accept the notification and VPN prompts inside the headset.
