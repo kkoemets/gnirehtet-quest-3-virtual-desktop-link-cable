@@ -38,6 +38,7 @@ pub const PLATFORM_TOOLS_WINDOWS_SHA256: &str =
 pub const SOCKS_PORT: u16 = 31_416;
 pub const CONTROL_PORT: u16 = 31_417;
 pub const UDP_STREAM_PORT: u16 = 31_418;
+const ANDROID_KEYCODE_WAKEUP: &str = "224";
 pub const ADB_DEVICE_COMMAND_TIMEOUT: Duration = Duration::from_secs(8);
 pub const ADB_MAPPING_COMMAND_TIMEOUT: Duration = Duration::from_secs(3);
 const ADB_INSTALL_TIMEOUT: Duration = Duration::from_secs(90);
@@ -680,6 +681,8 @@ impl AdbController {
         let allowed_package = VIRTUAL_DESKTOP_PACKAGE;
         self.require_device()
             .map_err(|failure| TransactionError::single("device_check", failure))?;
+        self.wake_android()
+            .map_err(|failure| TransactionError::single("device_wake", failure))?;
 
         // A host process can disappear after Android has committed its VPN
         // session and reverse mappings. Reusing those mappings lets the old
@@ -781,7 +784,20 @@ impl AdbController {
     pub fn stop(&self) -> Result<(), TransactionError> {
         self.require_device()
             .map_err(|failure| TransactionError::single("stop", failure))?;
+        self.wake_android()
+            .map_err(|failure| TransactionError::single("device_wake", failure))?;
         self.stop_android_session("stop")
+    }
+
+    fn wake_android(&self) -> Result<(), AdbError> {
+        self.run_checked(&strings(&[
+            "-d",
+            "shell",
+            "input",
+            "keyevent",
+            ANDROID_KEYCODE_WAKEUP,
+        ]))?;
+        Ok(())
     }
 
     fn stop_android_session(&self, phase: &'static str) -> Result<(), TransactionError> {
@@ -1473,6 +1489,7 @@ mod tests {
         let mock = Arc::new(MockAdb::with_results(vec![
             Ok(AdbOutput::success("device")),
             Ok(AdbOutput::success("")),
+            Ok(AdbOutput::success("")),
             Ok(AdbOutput::success("No services match")),
             Ok(AdbOutput::success("")),
             Ok(AdbOutput::success("")),
@@ -1502,6 +1519,7 @@ mod tests {
     fn stop_cleanup_runs_even_when_stop_request_fails() {
         let mock = Arc::new(MockAdb::with_results(vec![
             Ok(AdbOutput::success("device")),
+            Ok(AdbOutput::success("")),
             Ok(AdbOutput {
                 status: 1,
                 stdout: String::new(),
@@ -1521,6 +1539,15 @@ mod tests {
                 .count(),
             REVERSE_MAPPINGS.len()
         );
+        assert!(calls.iter().any(|args| {
+            args.iter().map(String::as_str).eq([
+                "-d",
+                "shell",
+                "input",
+                "keyevent",
+                ANDROID_KEYCODE_WAKEUP,
+            ])
+        }));
         assert!(!calls.iter().any(|args| args.iter().any(|arg| arg == "-W")));
     }
 
@@ -1528,6 +1555,7 @@ mod tests {
     fn already_stopped_is_idempotent_even_if_activity_command_fails() {
         let mock = Arc::new(MockAdb::with_results(vec![
             Ok(AdbOutput::success("device")),
+            Ok(AdbOutput::success("")),
             Ok(AdbOutput {
                 status: 1,
                 stdout: String::new(),
@@ -1558,6 +1586,7 @@ mod tests {
     fn start_uses_the_android_v4_all_traffic_contract() {
         let mock = Arc::new(MockAdb::with_results(vec![
             Ok(AdbOutput::success("device")),             // device check
+            Ok(AdbOutput::success("")),                   // wake headset
             Ok(AdbOutput::success("")),                   // stale STOP
             Ok(AdbOutput::success("No services match")),  // VPN closed
             Ok(AdbOutput::success("")),                   // remove SOCKS
@@ -1582,6 +1611,10 @@ mod tests {
             .iter()
             .position(|args| args.iter().any(|arg| arg == ACTION_STOP_V4))
             .unwrap();
+        let wake_index = calls
+            .iter()
+            .position(|args| args.iter().any(|arg| arg == ANDROID_KEYCODE_WAKEUP))
+            .unwrap();
         let start = calls
             .iter()
             .find(|args| args.iter().any(|arg| arg == ACTION_START_V4))
@@ -1590,6 +1623,7 @@ mod tests {
             .iter()
             .position(|args| args.iter().any(|arg| arg == ACTION_START_V4))
             .unwrap();
+        assert!(wake_index < stop_index);
         assert!(stop_index < start_index);
         for required in [
             ANDROID_CONTROL_ACTIVITY,
