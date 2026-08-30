@@ -28,8 +28,6 @@ pub const ANDROID_VPN_SERVICE: &str = "com.genymobile.gnirehtet/.v4.VdLinkVpnSer
 pub const ACTION_START_V4: &str = "com.genymobile.gnirehtet.v4.START";
 pub const ACTION_STOP_V4: &str = "com.genymobile.gnirehtet.v4.STOP";
 pub const VIRTUAL_DESKTOP_PACKAGE: &str = "VirtualDesktop.Android";
-const VIRTUAL_DESKTOP_LAUNCHER_CATEGORY: &str = "android.intent.category.LAUNCHER";
-const VIRTUAL_DESKTOP_RESTART_SETTLE: Duration = Duration::from_millis(750);
 pub const ANDROID_VERSION_CODE: &str = "56";
 pub const ANDROID_VERSION_NAME: &str = "4.1.4";
 pub const PLATFORM_TOOLS_VERSION: &str = "37.0.0";
@@ -930,54 +928,6 @@ impl AdbController {
             .to_owned())
     }
 
-    pub fn restart_virtual_desktop(&self) -> Result<(), AdbError> {
-        self.require_device()?;
-        let launcher = self.run_checked(&strings(&[
-            "-d",
-            "shell",
-            "cmd",
-            "package",
-            "resolve-activity",
-            "--brief",
-            "-c",
-            VIRTUAL_DESKTOP_LAUNCHER_CATEGORY,
-            VIRTUAL_DESKTOP_PACKAGE,
-        ]))?;
-        let component = parse_virtual_desktop_component(&launcher.stdout)
-            .ok_or(AdbError::VirtualDesktopActivityUnavailable)?;
-
-        self.run_checked(&strings(&[
-            "-d",
-            "shell",
-            "am",
-            "force-stop",
-            VIRTUAL_DESKTOP_PACKAGE,
-        ]))?;
-        thread::sleep(VIRTUAL_DESKTOP_RESTART_SETTLE);
-        self.run_checked(&[
-            "-d".into(),
-            "shell".into(),
-            "am".into(),
-            "start".into(),
-            "-n".into(),
-            component,
-        ])?;
-        Ok(())
-    }
-
-    pub fn stop_virtual_desktop(&self) -> Result<(), AdbError> {
-        self.require_device()?;
-        self.run_checked(&strings(&[
-            "-d",
-            "shell",
-            "am",
-            "force-stop",
-            VIRTUAL_DESKTOP_PACKAGE,
-        ]))?;
-        thread::sleep(VIRTUAL_DESKTOP_RESTART_SETTLE);
-        Ok(())
-    }
-
     pub fn android_status(&self) -> Result<AndroidVpnStatus, AdbError> {
         self.android_status_with_timeout(self.command_timeout)
     }
@@ -1236,8 +1186,6 @@ pub enum AdbError {
     CommandFailed { status: i32, stderr: String },
     #[error("{0}")]
     DeviceNotReady(String),
-    #[error("Virtual Desktop launcher activity is unavailable")]
-    VirtualDesktopActivityUnavailable,
     #[error("Android still reports an active VPN after the stop deadline")]
     VpnStillActive,
 }
@@ -1275,14 +1223,6 @@ impl TransactionError {
 
 fn strings(values: &[&str]) -> Vec<String> {
     values.iter().map(|value| (*value).to_owned()).collect()
-}
-
-fn parse_virtual_desktop_component(output: &str) -> Option<String> {
-    output.lines().rev().map(str::trim).find_map(|line| {
-        let activity = line.strip_prefix(VIRTUAL_DESKTOP_PACKAGE)?;
-        (activity.starts_with('/') && !line.chars().any(char::is_whitespace))
-            .then(|| line.to_owned())
-    })
 }
 
 fn package_version_matches(output: &str) -> bool {
@@ -1848,87 +1788,6 @@ mod tests {
         assert_eq!(error.phase, "device_check");
         assert!(error.failures[0].contains("accept the USB debugging prompt"));
         assert_eq!(mock.calls.lock().unwrap().len(), 1);
-    }
-
-    #[test]
-    fn virtual_desktop_restart_resolves_before_stopping_and_relaunches_exact_component() {
-        let component = "VirtualDesktop.Android/md59102214312e19799944a61bf7bc2f23e.VrActivity";
-        let mock = Arc::new(MockAdb::with_results(vec![
-            Ok(AdbOutput::success("device")),
-            Ok(AdbOutput::success(format!(
-                "priority=0 preferredOrder=0\n{component}\n"
-            ))),
-            Ok(AdbOutput::success("")),
-            Ok(AdbOutput::success("Starting")),
-        ]));
-        controller(mock.clone()).restart_virtual_desktop().unwrap();
-
-        let calls = mock.calls.lock().unwrap();
-        assert!(calls[1]
-            .iter()
-            .any(|argument| argument == "resolve-activity"));
-        assert!(calls[2]
-            .windows(2)
-            .any(|arguments| arguments == ["force-stop", VIRTUAL_DESKTOP_PACKAGE]));
-        assert!(calls[3]
-            .windows(2)
-            .any(|arguments| arguments == ["-n", component]));
-        assert!(!calls[3].iter().any(|argument| argument == "-W"));
-    }
-
-    #[test]
-    fn unresolved_virtual_desktop_activity_does_not_stop_the_app() {
-        let mock = Arc::new(MockAdb::with_results(vec![
-            Ok(AdbOutput::success("device")),
-            Ok(AdbOutput::success("No activity found")),
-        ]));
-        let error = controller(mock.clone())
-            .restart_virtual_desktop()
-            .unwrap_err();
-
-        assert!(matches!(error, AdbError::VirtualDesktopActivityUnavailable));
-        assert_eq!(mock.calls.lock().unwrap().len(), 2);
-    }
-
-    #[test]
-    fn virtual_desktop_restart_recovers_a_wedged_adb_server() {
-        let component = "VirtualDesktop.Android/test.VirtualDesktopActivity";
-        let mock = Arc::new(MockAdb::with_results(vec![
-            Err(AdbError::Timeout(Duration::from_millis(10))),
-            Ok(AdbOutput::success("device")),
-            Ok(AdbOutput::success(component)),
-            Ok(AdbOutput::success("")),
-            Ok(AdbOutput::success("Starting")),
-        ]));
-
-        controller(mock.clone()).restart_virtual_desktop().unwrap();
-
-        assert_eq!(mock.recoveries.load(Ordering::Relaxed), 1);
-        let calls = mock.calls.lock().unwrap();
-        assert_eq!(
-            calls
-                .iter()
-                .filter(|args| args.iter().any(|argument| argument == "get-state"))
-                .count(),
-            2
-        );
-    }
-
-    #[test]
-    fn virtual_desktop_stop_recovers_adb_before_quiescing_the_app() {
-        let mock = Arc::new(MockAdb::with_results(vec![
-            Err(AdbError::Timeout(Duration::from_millis(10))),
-            Ok(AdbOutput::success("device")),
-            Ok(AdbOutput::success("")),
-        ]));
-
-        controller(mock.clone()).stop_virtual_desktop().unwrap();
-
-        assert_eq!(mock.recoveries.load(Ordering::Relaxed), 1);
-        let calls = mock.calls.lock().unwrap();
-        assert!(calls[2]
-            .windows(2)
-            .any(|arguments| arguments == ["force-stop", VIRTUAL_DESKTOP_PACKAGE]));
     }
 
     #[test]
