@@ -14,7 +14,7 @@ $apk = (Resolve-Path $ApkPath).Path
 $androidArtifacts = (Resolve-Path $AndroidArtifactsDirectory).Path
 $output = [System.IO.Path]::GetFullPath($OutputDirectory)
 $target = "x86_64-pc-windows-msvc"
-$expectedVersion = "4.1.30"
+$expectedVersion = "4.1.34"
 $builtExe = Join-Path $repoRoot "host-rust\target\$target\release\quest-vd-wired.exe"
 
 function Invoke-Checked {

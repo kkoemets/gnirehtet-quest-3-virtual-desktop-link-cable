@@ -420,8 +420,8 @@ class CommandLineToolsTest(unittest.TestCase):
                 "#!/bin/sh\n"
                 "case \"$2\" in\n"
                 "application-id) echo com.genymobile.gnirehtet ;;\n"
-                "version-code) echo 65 ;;\n"
-                "version-name) echo 4.1.20 ;;\n"
+                "version-code) echo 72 ;;\n"
+                "version-name) echo 4.1.34 ;;\n"
                 "min-sdk) echo 29 ;;\n"
                 "target-sdk) echo 36 ;;\n"
                 "debuggable) echo false ;;\n"
@@ -538,18 +538,18 @@ class ReleasePolicyTest(unittest.TestCase):
         ignore = (REPOSITORY / ".gitignore").read_text(encoding="utf-8")
 
         self.assertIn('<h1 align="center">Quest VD Wired</h1>', readme)
-        self.assertIn("Download v4.1.30", readme)
-        self.assertIn("quest-vd-wired-v4.1.30-windows-x64.zip", readme)
+        self.assertIn("Download v4.1.34", readme)
+        self.assertIn("quest-vd-wired-v4.1.34-windows-x64.zip", readme)
         self.assertIn("quest-vd-wired.exe", readme)
         self.assertNotIn("docs/", readme)
         self.assertIn("/docs/", ignore)
         self.assertTrue((REPOSITORY / "release").is_file())
         self.assertTrue((REPOSITORY / "scripts/build_v4_android_rc.sh").is_file())
         self.assertTrue((REPOSITORY / "scripts/build_v4_windows_rc.ps1").is_file())
-        self.assertIn('versionCode = 65', android_v4)
-        self.assertIn('versionName = "4.1.20"', android_v4)
+        self.assertIn('versionCode = 72', android_v4)
+        self.assertIn('versionName = "4.1.34"', android_v4)
         self.assertIn('<string name="app_name">Quest VD Wired</string>', android_strings)
-        self.assertIn('version = "4.1.30"', rust_v4)
+        self.assertIn('version = "4.1.34"', rust_v4)
 
     def test_virtual_desktop_processes_are_not_part_of_transport_recovery(self) -> None:
         sources = "\n".join(

@@ -194,7 +194,7 @@ dependencies = [
 
 [[package]]
 name = "gnirehtet-vd"
-version = "4.1.30"
+version = "4.1.34"
 dependencies = [
  "anyhow",
  "clap",
