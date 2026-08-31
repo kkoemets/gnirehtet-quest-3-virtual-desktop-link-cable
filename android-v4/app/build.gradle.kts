@@ -102,8 +102,8 @@ android {
         applicationId = "com.genymobile.gnirehtet"
         minSdk = 29
         targetSdk = 36
-        versionCode = 65
-        versionName = "4.1.20"
+        versionCode = 72
+        versionName = "4.1.34"
 
         testInstrumentationRunner = "androidx.test.runner.AndroidJUnitRunner"
         ndk {

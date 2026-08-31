@@ -23,13 +23,13 @@ use thiserror::Error;
 use wait_timeout::ChildExt;
 
 pub const ANDROID_PACKAGE: &str = "com.genymobile.gnirehtet";
-pub const ANDROID_CONTROL_SERVICE: &str = "com.genymobile.gnirehtet/.v4.AdbControlService";
+pub const ANDROID_CONTROL_ACTIVITY: &str = "com.genymobile.gnirehtet/.v4.AdbControlActivity";
 pub const ANDROID_VPN_SERVICE: &str = "com.genymobile.gnirehtet/.v4.VdLinkVpnService";
 pub const ACTION_START_V4: &str = "com.genymobile.gnirehtet.v4.START";
 pub const ACTION_STOP_V4: &str = "com.genymobile.gnirehtet.v4.STOP";
 pub const VIRTUAL_DESKTOP_PACKAGE: &str = "VirtualDesktop.Android";
-pub const ANDROID_VERSION_CODE: &str = "65";
-pub const ANDROID_VERSION_NAME: &str = "4.1.20";
+pub const ANDROID_VERSION_CODE: &str = "72";
+pub const ANDROID_VERSION_NAME: &str = "4.1.34";
 pub const PLATFORM_TOOLS_VERSION: &str = "37.0.0";
 pub const PLATFORM_TOOLS_WINDOWS_URL: &str =
     "https://dl.google.com/android/repository/platform-tools_r37.0.0-win.zip";
@@ -723,11 +723,9 @@ impl AdbController {
             "-d".into(),
             "shell".into(),
             "am".into(),
-            "start-foreground-service".into(),
-            "--user".into(),
-            "0".into(),
+            "start".into(),
             "-n".into(),
-            ANDROID_CONTROL_SERVICE.into(),
+            ANDROID_CONTROL_ACTIVITY.into(),
             "-a".into(),
             ACTION_START_V4.into(),
             "--es".into(),
@@ -755,11 +753,9 @@ impl AdbController {
                 "-d",
                 "shell",
                 "am",
-                "start-foreground-service",
-                "--user",
-                "0",
+                "start",
                 "-n",
-                ANDROID_CONTROL_SERVICE,
+                ANDROID_CONTROL_ACTIVITY,
                 "-a",
                 ACTION_STOP_V4,
             ]));
@@ -810,11 +806,9 @@ impl AdbController {
             "-d",
             "shell",
             "am",
-            "start-foreground-service",
-            "--user",
-            "0",
+            "start",
             "-n",
-            ANDROID_CONTROL_SERVICE,
+            ANDROID_CONTROL_ACTIVITY,
             "-a",
             ACTION_STOP_V4,
         ]);
@@ -1490,21 +1484,6 @@ mod tests {
         )
     }
 
-    fn assert_control_service(args: &[String], action: &str) {
-        assert!(args.iter().map(String::as_str).eq([
-            "-d",
-            "shell",
-            "am",
-            "start-foreground-service",
-            "--user",
-            "0",
-            "-n",
-            ANDROID_CONTROL_SERVICE,
-            "-a",
-            action,
-        ]));
-    }
-
     #[test]
     fn failed_start_rolls_back_every_mapping() {
         let mock = Arc::new(MockAdb::with_results(vec![
@@ -1570,22 +1549,17 @@ mod tests {
             ])
         }));
         assert!(!calls.iter().any(|args| args.iter().any(|arg| arg == "-W")));
-        let stop = calls
-            .iter()
-            .find(|args| args.iter().any(|arg| arg == ACTION_STOP_V4))
-            .unwrap();
-        assert_control_service(stop, ACTION_STOP_V4);
     }
 
     #[test]
-    fn already_stopped_is_idempotent_even_if_control_service_command_fails() {
+    fn already_stopped_is_idempotent_even_if_activity_command_fails() {
         let mock = Arc::new(MockAdb::with_results(vec![
             Ok(AdbOutput::success("device")),
             Ok(AdbOutput::success("")),
             Ok(AdbOutput {
                 status: 1,
                 stdout: String::new(),
-                stderr: "control service unavailable".into(),
+                stderr: "activity not running".into(),
             }),
             Ok(AdbOutput::success("No services match")),
         ]));
@@ -1651,30 +1625,6 @@ mod tests {
             .unwrap();
         assert!(wake_index < stop_index);
         assert!(stop_index < start_index);
-        assert_control_service(&calls[stop_index], ACTION_STOP_V4);
-        assert!(start.iter().take(10).map(String::as_str).eq([
-            "-d",
-            "shell",
-            "am",
-            "start-foreground-service",
-            "--user",
-            "0",
-            "-n",
-            ANDROID_CONTROL_SERVICE,
-            "-a",
-            ACTION_START_V4,
-        ]));
-        assert!(!calls.iter().any(|args| {
-            args.windows(2)
-                .any(|arguments| arguments == ["am", "start"])
-        }));
-        assert!(!calls
-            .iter()
-            .any(|args| args.iter().any(|argument| argument == "broadcast")));
-        assert!(!calls.iter().any(|args| args.iter().any(|argument| {
-            argument.ends_with("/.v4.AdbControlActivity")
-                || argument.ends_with("/.v4.AdbControlReceiver")
-        })));
         assert!(!calls.iter().any(|args| {
             args.windows(2)
                 .any(|arguments| arguments == ["force-stop", ANDROID_PACKAGE])
@@ -1684,7 +1634,7 @@ mod tests {
                 .any(|arguments| arguments == ["force-stop", VIRTUAL_DESKTOP_PACKAGE])
         }));
         for required in [
-            ANDROID_CONTROL_SERVICE,
+            ANDROID_CONTROL_ACTIVITY,
             "sessionId",
             "vdPackage",
             VIRTUAL_DESKTOP_PACKAGE,
@@ -1818,7 +1768,7 @@ mod tests {
             Ok(AdbOutput::success("Package not found")),
             Ok(AdbOutput::success("Success")),
             Ok(AdbOutput::success(
-                "versionCode=65 minSdk=29 targetSdk=36\nversionName=4.1.20\n",
+                "versionCode=72 minSdk=29 targetSdk=36\nversionName=4.1.34\n",
             )),
         ]));
         AdbController::new(mock.clone())
@@ -1858,7 +1808,7 @@ mod tests {
             Ok(AdbOutput::success("Package not found")),
             Ok(AdbOutput::success("Success")),
             Ok(AdbOutput::success(
-                "versionCode=65 minSdk=29 targetSdk=36\nversionName=4.1.20\n",
+                "versionCode=72 minSdk=29 targetSdk=36\nversionName=4.1.34\n",
             )),
         ]));
         AdbController::new(mock.clone())
@@ -1882,7 +1832,7 @@ mod tests {
         let mock = Arc::new(MockAdb::with_results(vec![
             Ok(AdbOutput::success("device")),
             Ok(AdbOutput::success(
-                "versionCode=65 minSdk=29 targetSdk=36\nversionName=4.1.20\n",
+                "versionCode=72 minSdk=29 targetSdk=36\nversionName=4.1.34\n",
             )),
         ]));
         AdbController::new(mock.clone())

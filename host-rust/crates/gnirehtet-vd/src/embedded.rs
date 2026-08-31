@@ -12,6 +12,9 @@ pub fn materialize(destination: &Path) -> Result<(), EmbeddedApkError> {
     if let Some(parent) = destination.parent() {
         fs::create_dir_all(parent)?;
     }
+    if fs::read(destination).is_ok_and(|existing| existing == apk) {
+        return Ok(());
+    }
     fs::write(destination, apk)?;
     Ok(())
 }

@@ -56,8 +56,8 @@ version_name="$("$apkanalyzer" manifest version-name "$apk")"
 min_sdk="$("$apkanalyzer" manifest min-sdk "$apk")"
 target_sdk="$("$apkanalyzer" manifest target-sdk "$apk")"
 debuggable="$("$apkanalyzer" manifest debuggable "$apk" | tr '[:upper:]' '[:lower:]')"
-if [[ "$version_code" != "65" || "$version_name" != "4.1.20" ]]; then
-    echo "APK version is not the exact v4.1.20 helper identity" >&2
+if [[ "$version_code" != "72" || "$version_name" != "4.1.34" ]]; then
+    echo "APK version is not the exact v4.1.34 helper identity" >&2
     exit 1
 fi
 if [[ "$debuggable" != "false" ]]; then

@@ -15,7 +15,7 @@ use serde_json::json;
 use thiserror::Error;
 use tokio::{
     io::{self, AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt},
-    net::{TcpListener, TcpStream},
+    net::{TcpListener, TcpSocket, TcpStream},
     sync::{watch, Semaphore},
     time,
 };
@@ -612,10 +612,21 @@ impl SocksServer {
         let flow_started = time::Instant::now();
         let upstream = time::timeout(self.config.connect_timeout, async {
             let resolved_target = destination.resolve().await?;
-            Ok::<_, SocksError>(TcpStream::connect(resolved_target).await?)
+            let canonical_local_target =
+                vd_streamer_flow && socket_address_is_local(resolved_target);
+            let connect_target = if canonical_local_target {
+                physical_lan_ipv4_target(destination_port).unwrap_or(resolved_target)
+            } else {
+                resolved_target
+            };
+            let canonicalized = connect_target.ip() != resolved_target.ip();
+            let upstream = TcpStream::connect(connect_target)
+                .await
+                .map_err(crate::udp::UdpRelayError::from)?;
+            Ok::<_, crate::udp::UdpRelayError>((upstream, canonicalized))
         })
         .await;
-        let upstream = match upstream {
+        let (upstream, canonicalized) = match upstream {
             Ok(Ok(stream)) => stream,
             Ok(Err(error)) => {
                 let _ = write_reply(
@@ -624,7 +635,7 @@ impl SocksServer {
                     Endpoint::Socket(SocketAddr::new(Ipv4Addr::UNSPECIFIED.into(), 0)),
                 )
                 .await;
-                return Err(error);
+                return Err(error.into());
             }
             Err(_) => {
                 let _ = write_reply(
@@ -636,6 +647,14 @@ impl SocksServer {
                 return Err(SocksError::ConnectTimeout);
             }
         };
+        if canonicalized {
+            if let Some(diagnostics) = &self.diagnostics {
+                let _ = diagnostics.record(
+                    "vd_streamer_local_target_canonicalized",
+                    json!({"destination_port": destination_port}),
+                );
+            }
+        }
         client.set_nodelay(true)?;
         upstream.set_nodelay(true)?;
         let bound = upstream.local_addr()?;
@@ -711,6 +730,101 @@ fn endpoint_port(endpoint: &Endpoint) -> u16 {
         Endpoint::Socket(address) => address.port(),
         Endpoint::Domain(_, port) => *port,
     }
+}
+
+fn socket_address_is_local(mut target: SocketAddr) -> bool {
+    target.set_port(0);
+    let socket = match target {
+        SocketAddr::V4(_) => TcpSocket::new_v4(),
+        SocketAddr::V6(_) => TcpSocket::new_v6(),
+    };
+    socket.and_then(|socket| socket.bind(target)).is_ok()
+}
+
+#[cfg(not(windows))]
+fn physical_lan_ipv4_target(_destination_port: u16) -> Option<SocketAddr> {
+    None
+}
+
+#[cfg(windows)]
+fn physical_lan_ipv4_target(destination_port: u16) -> Option<SocketAddr> {
+    use std::mem::size_of;
+    use windows_sys::Win32::{
+        Foundation::ERROR_BUFFER_OVERFLOW,
+        NetworkManagement::{
+            IpHelper::{
+                GetAdaptersAddresses, GAA_FLAG_INCLUDE_GATEWAYS, GAA_FLAG_SKIP_ANYCAST,
+                GAA_FLAG_SKIP_DNS_SERVER, GAA_FLAG_SKIP_MULTICAST, IF_TYPE_ETHERNET_CSMACD,
+                IF_TYPE_IEEE80211, IP_ADAPTER_ADDRESSES_LH,
+            },
+            Ndis::IfOperStatusUp,
+        },
+        Networking::WinSock::{AF_INET, SOCKADDR_IN},
+    };
+
+    let flags = GAA_FLAG_INCLUDE_GATEWAYS
+        | GAA_FLAG_SKIP_ANYCAST
+        | GAA_FLAG_SKIP_MULTICAST
+        | GAA_FLAG_SKIP_DNS_SERVER;
+    let mut bytes = 0u32;
+    let result = unsafe {
+        GetAdaptersAddresses(
+            AF_INET as u32,
+            flags,
+            std::ptr::null(),
+            std::ptr::null_mut(),
+            &mut bytes,
+        )
+    };
+    if result != ERROR_BUFFER_OVERFLOW || bytes == 0 {
+        return None;
+    }
+
+    let words = (bytes as usize).div_ceil(size_of::<usize>());
+    let mut storage = vec![0usize; words];
+    let mut adapter = storage.as_mut_ptr().cast::<IP_ADAPTER_ADDRESSES_LH>();
+    if unsafe { GetAdaptersAddresses(AF_INET as u32, flags, std::ptr::null(), adapter, &mut bytes) }
+        != 0
+    {
+        return None;
+    }
+
+    let mut selected: Option<(u32, Ipv4Addr)> = None;
+    while !adapter.is_null() {
+        let current = unsafe { &*adapter };
+        let physical = matches!(current.IfType, IF_TYPE_ETHERNET_CSMACD | IF_TYPE_IEEE80211);
+        if current.OperStatus == IfOperStatusUp
+            && physical
+            && !current.FirstGatewayAddress.is_null()
+        {
+            let mut unicast = current.FirstUnicastAddress;
+            while !unicast.is_null() {
+                let address = unsafe { &*unicast }.Address;
+                if !address.lpSockaddr.is_null()
+                    && address.iSockaddrLength as usize >= size_of::<SOCKADDR_IN>()
+                {
+                    let ipv4 = unsafe { &*address.lpSockaddr.cast::<SOCKADDR_IN>() };
+                    if ipv4.sin_family == AF_INET {
+                        let octets = unsafe { ipv4.sin_addr.S_un.S_un_b };
+                        let candidate =
+                            Ipv4Addr::new(octets.s_b1, octets.s_b2, octets.s_b3, octets.s_b4);
+                        if !candidate.is_loopback() && !candidate.is_unspecified() {
+                            let replace = selected
+                                .as_ref()
+                                .is_none_or(|(metric, _)| current.Ipv4Metric < *metric);
+                            if replace {
+                                selected = Some((current.Ipv4Metric, candidate));
+                            }
+                        }
+                    }
+                }
+                unicast = unsafe { (*unicast).Next };
+            }
+        }
+        adapter = current.Next;
+    }
+
+    selected.map(|(_, address)| SocketAddr::new(address.into(), destination_port))
 }
 
 async fn negotiate_auth<S>(stream: &mut S) -> Result<(), SocksError>
@@ -905,39 +1019,6 @@ mod tests {
         );
     }
 
-    #[tokio::test]
-    async fn duplicate_local_vd_candidates_connect_to_the_exact_requested_target() {
-        let mut upstream = None;
-        for port in VIRTUAL_DESKTOP_STREAMER_PORTS {
-            if let Ok(listener) = TcpListener::bind((Ipv4Addr::LOCALHOST, port)).await {
-                upstream = Some(listener);
-                break;
-            }
-        }
-        let upstream = upstream.expect("no Virtual Desktop test port was available");
-        let destination = upstream.local_addr().unwrap();
-        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
-        let address = listener.local_addr().unwrap();
-        let server = SocksServer::new(SocksConfig {
-            bind: address,
-            ..Default::default()
-        })
-        .unwrap();
-        let task = tokio::spawn(server.serve_on(listener));
-
-        let _client_a = connect_through_socks(address, destination).await;
-        let _client_b = connect_through_socks(address, destination).await;
-        for _ in 0..2 {
-            let accepted = time::timeout(Duration::from_millis(100), upstream.accept())
-                .await
-                .expect("exact requested target was not connected")
-                .unwrap();
-            assert_eq!(accepted.1.ip(), Ipv4Addr::LOCALHOST);
-        }
-
-        task.abort();
-    }
-
     #[test]
     fn virtual_desktop_health_requires_forwarding_on_all_four_live_ports() {
         let monitor = VirtualDesktopFlowMonitor::default();
@@ -1113,6 +1194,50 @@ mod tests {
         assert_eq!(stats.stats().tcp_tx_bytes, byte_count);
         assert_eq!(stats.stats().tcp_rx_bytes, byte_count);
         task.abort();
+    }
+
+    #[tokio::test]
+    async fn allows_overlapping_virtual_desktop_flows_on_the_same_port() {
+        let vd_port = VIRTUAL_DESKTOP_STREAMER_PORTS[0];
+        let echo = TcpListener::bind((Ipv4Addr::UNSPECIFIED, vd_port))
+            .await
+            .unwrap();
+        let echo_task = tokio::spawn(async move {
+            loop {
+                let (mut stream, _) = echo.accept().await.unwrap();
+                tokio::spawn(async move {
+                    let (mut reader, mut writer) = stream.split();
+                    let _ = io::copy(&mut reader, &mut writer).await;
+                });
+            }
+        });
+
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = SocksServer::new(SocksConfig {
+            bind: address,
+            ..Default::default()
+        })
+        .unwrap();
+        let stats = server.clone();
+        let task = tokio::spawn(server.serve_on(listener));
+        let destination = SocketAddr::new(Ipv4Addr::LOCALHOST.into(), vd_port);
+
+        let mut first = connect_through_socks(address, destination).await;
+        let mut second = connect_through_socks(address, destination).await;
+        first.write_all(b"first").await.unwrap();
+        second.write_all(b"second").await.unwrap();
+        let mut first_echo = [0; 5];
+        let mut second_echo = [0; 6];
+        first.read_exact(&mut first_echo).await.unwrap();
+        second.read_exact(&mut second_echo).await.unwrap();
+
+        assert_eq!(&first_echo, b"first");
+        assert_eq!(&second_echo, b"second");
+        assert_eq!(stats.stats().virtual_desktop.active_flows[0], 2);
+
+        task.abort();
+        echo_task.abort();
     }
 
     #[tokio::test]

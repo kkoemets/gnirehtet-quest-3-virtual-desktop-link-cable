@@ -9,6 +9,26 @@ import org.junit.Test
 
 class HevTunnelLifecycleTest {
     @Test
+    fun replacesAnOrphanedEngineFromAnEarlierServiceInstance() {
+        val bridge = FakeBridge(stopAccepted = true)
+        val processState = HevProcessState()
+        HevTunnel(testDirectory(), bridge, processState).start(
+            tunFd = 41,
+            socksPort = 31_416,
+            udpPort = 31_418,
+        )
+
+        HevTunnel(testDirectory(), bridge, processState).start(
+            tunFd = 42,
+            socksPort = 31_416,
+            udpPort = 31_418,
+        )
+
+        assertEquals(listOf(7L), bridge.stopTokens)
+        assertEquals(2, bridge.startCount)
+    }
+
+    @Test
     fun rejectsAStopForAStaleNativeGeneration() {
         val bridge = FakeBridge(stopAccepted = false)
         val tunnel = HevTunnel(testDirectory(), bridge)
@@ -41,8 +61,12 @@ class HevTunnelLifecycleTest {
         var stoppedResult: Int = 1,
     ) : HevNativeBridge {
         val stopTokens = mutableListOf<Long>()
+        var startCount = 0
 
-        override fun start(configPath: String, tunFd: Int): Long = 7
+        override fun start(configPath: String, tunFd: Int): Long {
+            startCount++
+            return 7
+        }
 
         override fun awaitReady(token: Long, timeoutMs: Int): Int = 1
 
