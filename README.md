@@ -9,6 +9,25 @@
   Simple wired networking without relying on Quest Wi-Fi.
 </p>
 
+## Try official Virtual Desktop USB first
+
+Virtual Desktop now supports wired USB connections directly. As of August 31,
+2026, the Quest app must use its beta release channel. The standard PC Streamer
+already supports USB.
+
+1. Install or update Virtual Desktop Streamer from the
+   [official website](https://www.vrdesktop.net/).
+2. On the Quest, long-press the Virtual Desktop tile, open **Settings → Release
+   Channels**, select **BETA**, and install the update.
+3. Connect the Quest with a USB data cable and open Virtual Desktop.
+4. Accept **Allow USB connection** in the headset.
+5. Disconnect any wireless VD session, refresh the computer list, and select the
+   PC with the USB icon.
+
+If this works, you do not need Quest VD Wired. This project is no longer
+maintained and is being archived now that Virtual Desktop provides official USB
+support.
+
 <p align="center">
   <a href="https://github.com/kkoemets/quest-vd-wired/releases/latest"><img alt="Latest release" src="https://img.shields.io/github/v/release/kkoemets/quest-vd-wired?display_name=tag&amp;sort=semver"></a>
   <a href="LICENSE"><img alt="Apache 2.0 license" src="https://img.shields.io/github/license/kkoemets/quest-vd-wired"></a>
